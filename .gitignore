@@ -1,4 +1,5 @@
 .DS_Store
 *.log
 *.tmp
-*.csv
+# Allow CSV files in examples folder
+!examples/*.csv
