@@ -4,6 +4,8 @@ This document explains how [ownership.md](https://github.com/openshift/origin/bl
 
 ## Overview
 
+The `ownership.md` file is a **TLS registry for OpenShift platform operators and components**. It serves as the authoritative documentation of all TLS certificates and CA bundles managed by core OpenShift platform components, tracking their ownership, lifecycle, and management status. This registry ensures proper certificate governance, rotation compliance, and ownership accountability for the OpenShift platform infrastructure.
+
 ## How ownership.md is Generated
 
 ### **Generation Process**
