@@ -4,8 +4,6 @@ This document explains how [ownership.md](https://github.com/openshift/origin/bl
 
 ## Overview
 
-**Answer to "Are these layered products?":** No, these are **core OpenShift platform components**, not layered products. The ownership.md file tracks certificates from OpenShift's core platform namespaces and operators, not third-party products installed on top of OpenShift.
-
 ## How ownership.md is Generated
 
 ### **Generation Process**
