@@ -207,18 +207,6 @@ The components in ownership.md are **OpenShift core platform components**:
 12. **End User** (1 certificate)
     - User-provided certificates
 
-### **Why MCE/OCM Certificates Don't Appear**
-
-Certificates from products like:
-- MultiCluster Engine (MCE) - `multicluster-engine` namespace
-- Open Cluster Management (OCM) - `open-cluster-management-*` namespaces
-- MetalLB - `metallb-system` namespace
-
-**Are NOT in ownership.md** because:
-1. These namespaces don't match platform namespace patterns (`openshift-*`, `kubernetes-*`)
-2. They are considered "layered products" - installed on top of OpenShift
-3. They have their own certificate management outside OpenShift's core platform
-
 ## Layered Products with owning-component Annotation
 
 ### **The Service-CA Case**
