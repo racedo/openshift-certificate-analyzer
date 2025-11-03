@@ -273,31 +273,6 @@ This means:
 
 **Conclusion**: The annotation requirement is enforced only for platform namespaces. Layered products using Service-CA get the annotation automatically, but are excluded from tracking and validation.
 
-## Summary: Requirements Checklist
-
-For a certificate to appear in `ownership.md`:
-
-✅ **MUST be in a platform namespace**:
-- `openshift-*` prefix
-- `kubernetes-*` prefix  
-- Or well-known: `openshift`, `default`, `kube-system`, `kube-public`, `kubernetes`
-
-✅ **MUST have `openshift.io/owning-component` annotation**:
-- Value becomes the Jira component owner
-- Format: `openshift.io/owning-component: <Component Name>`
-
-✅ **MUST contain valid TLS data**:
-- Parsable X.509 certificate
-- In Secret or ConfigMap with recognized data fields
-
-✅ **MUST pass e2e tests**:
-- No new violations added
-- Matches expected registry entries
-
-❌ **CANNOT be from non-platform namespaces**:
-- User namespaces excluded
-- Layered product namespaces excluded (MCE, ACM, etc.)
-
 ## References
 
 - **Ownership.md Source**: https://github.com/openshift/origin/blob/main/tls/ownership/ownership.md
