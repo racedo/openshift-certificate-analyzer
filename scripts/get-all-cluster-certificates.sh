@@ -151,6 +151,98 @@ is_cluster_proxy_ca_signed() {
     return 1
 }
 
+# Function to determine CA category from issuer and managed details
+determine_ca_category() {
+    local issuer="$1"
+    local managed_details="$2"
+    local annotations="$3"
+    
+    # Normalize issuer string for matching (handle CN=, OU= prefixes)
+    local issuer_normalized="$issuer"
+    
+    # Service-CA (check annotations first, then issuer)
+    if [[ "$annotations" =~ (service-ca) ]] || [[ "$issuer_normalized" =~ (openshift-service-serving-signer) ]]; then
+        echo "Service-CA"
+        return
+    fi
+    
+    # Cluster-Proxy CA
+    if [[ "$issuer_normalized" =~ (open-cluster-management:cluster-proxy) ]]; then
+        echo "Cluster-Proxy CA"
+        return
+    fi
+    
+    # Kube-CSR-Signer (check both patterns)
+    if [[ "$issuer_normalized" =~ (kube-csr-signer_@|kube-csr-signer[^_]) ]]; then
+        echo "Kube-CSR-Signer"
+        return
+    fi
+    
+    # Cluster-Manager-Webhook
+    if [[ "$issuer_normalized" =~ (cluster-manager-webhook) ]]; then
+        echo "Cluster-Manager-Webhook"
+        return
+    fi
+    
+    # OVN CA (must come before generic openshift patterns)
+    if [[ "$issuer_normalized" =~ (openshift-ovn-kubernetes) ]]; then
+        echo "OVN CA"
+        return
+    fi
+    
+    # Monitoring CA (must come before generic openshift patterns)
+    if [[ "$issuer_normalized" =~ (openshift-cluster-monitoring) ]]; then
+        echo "Monitoring CA"
+        return
+    fi
+    
+    # Konnectivity CA
+    if [[ "$issuer_normalized" =~ (konnectivity-signer) ]]; then
+        echo "Konnectivity CA"
+        return
+    fi
+    
+    # Ingress CA
+    if [[ "$issuer_normalized" =~ (ingress-operator) ]]; then
+        echo "Ingress CA"
+        return
+    fi
+    
+    # OLM CA
+    if [[ "$issuer_normalized" =~ (olm-selfsigned) ]]; then
+        echo "OLM CA"
+        return
+    fi
+    
+    # External CA (ACCVRAIZ1, etc.)
+    if [[ "$issuer_normalized" =~ (ACCVRAIZ1|PKIACCV) ]]; then
+        echo "External CA"
+        return
+    fi
+    
+    # Platform-CA (root-ca, kube-apiserver-to-kubelet-signer, etc.)
+    # Check for root-ca first (most common)
+    if [[ "$issuer_normalized" =~ (root-ca) ]]; then
+        echo "Platform-CA"
+        return
+    fi
+    
+    # Check for kube-apiserver-to-kubelet-signer
+    if [[ "$issuer_normalized" =~ (kube-apiserver-to-kubelet-signer) ]]; then
+        echo "Platform-CA"
+        return
+    fi
+    
+    # Generic platform patterns (must come last)
+    if [[ "$issuer_normalized" =~ (etcd|kube-apiserver|kube-controller-manager|openshift|kubernetes) ]]; then
+        echo "Platform-CA"
+        return
+    fi
+    
+    # Default: Unknown
+    echo "Unknown"
+}
+
 # Function to check if certificate validity period matches auto-rotation pattern
 # NOTE: This is informational only - we cannot rely on validity period alone to determine
 # platform management, as users can create their own CAs with 2-year validity.
@@ -595,6 +687,24 @@ process_resource() {
     fi
     # else: User-Managed (default) - certificates not in platform namespaces and without indicators
     
+    # Determine CA category from issuer and managed details
+    local ca_category=""
+    local issuer_for_category="$issuer"
+    
+    # If issuer is not available, extract from managed_details
+    if [[ -z "$issuer_for_category" || "$issuer_for_category" == "N/A" ]]; then
+        if [[ "$managed_details" =~ Issuer:\ ([^;]+) ]]; then
+            issuer_for_category="${BASH_REMATCH[1]}"
+        fi
+    fi
+    
+    # Determine CA category
+    if [[ -n "$issuer_for_category" && "$issuer_for_category" != "N/A" ]]; then
+        ca_category=$(determine_ca_category "$issuer_for_category" "$managed_details" "$relevant_annotations")
+    else
+        ca_category="Unknown"
+    fi
+    
     # Build CSV line
     local csv_line=""
     csv_line+="$(escape_csv "$resource_type"),"
@@ -606,6 +716,7 @@ process_resource() {
     csv_line+="$(escape_csv "$fingerprint"),"
     csv_line+="$(escape_csv "$managed_status"),"
     csv_line+="$(escape_csv "$managed_details"),"
+    csv_line+="$(escape_csv "$ca_category"),"
     csv_line+="$(escape_csv "$relevant_annotations"),"
     csv_line+="$(escape_csv "$oc_command"),"
     csv_line+="$(escape_csv "$openssl_command")"
@@ -614,7 +725,7 @@ process_resource() {
 }
 
 # Initialize CSV file with headers
-echo "Secret/ConfigMap,Name,Namespace,Data Fields,Validity (years),Actual Expiry,Fingerprint,Managed Status,Managed Details,Relevant Annotations,OC Describe Command,OpenSSL Command" > "$CSV_FILE"
+echo "Secret/ConfigMap,Name,Namespace,Data Fields,Validity (years),Actual Expiry,Fingerprint,Managed Status,Managed Details,CA,Relevant Annotations,OC Describe Command,OpenSSL Command" > "$CSV_FILE"
 
 # Step 1: Get all secrets with their metadata and data keys only (avoid binary data)
 echo -e "${YELLOW}📋 Fetching all secrets from cluster...${NC}"
@@ -915,6 +1026,7 @@ echo "   - Actual Expiry: Certificate expiration date"
 echo "   - Fingerprint: SHA256 fingerprint of the certificate"
 echo "   - Managed Status: Platform-Managed (Auto-Rotated), Platform-Managed (10-Year, Not Auto-Rotated), or User-Managed (Not Auto-Rotated)"
 echo "   - Managed Details: Certificate issuer and validity information"
+echo "   - CA: CA/Signer category (Service-CA, Platform-CA, Cluster-Proxy CA, Kube-CSR-Signer, Cluster-Manager-Webhook, OVN CA, Monitoring CA, Konnectivity CA, Ingress CA, OLM CA, External CA, or Unknown)"
 echo "   - Relevant Annotations: openshift.io/owning-component, auth.openshift.io/certificate-not-before, auth.openshift.io/certificate-not-after, etc."
 echo "   - OC Describe Command: oc describe command"
 echo "   - OpenSSL Command: openssl command"
