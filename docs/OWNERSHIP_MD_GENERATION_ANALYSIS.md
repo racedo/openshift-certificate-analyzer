@@ -163,50 +163,6 @@ func generateViolationJSON(pkiInfo *certs.PKIRegistryInfo) *certs.PKIRegistryInf
 }
 ```
 
-## Components Listed in ownership.md
-
-### **Core Platform Components** (Not Layered Products)
-
-The components in ownership.md are **OpenShift core platform components**:
-
-1. **Networking / cluster-network-operator** (41 certificates)
-   - Core OpenShift networking operator
-   - Manages CNI, OVN, service mesh certificates
-
-2. **Monitoring** (8 certificates)
-   - OpenShift monitoring stack
-   - Prometheus, Thanos, Alertmanager certificates
-
-3. **Image Registry** (4 certificates)
-   - OpenShift integrated registry
-
-4. **Machine Config Operator** (6 certificates)
-   - Core OpenShift node configuration operator
-
-5. **Operator Framework / operator-lifecycle-manager** (2 certificates)
-   - OpenShift's OLM for operator management
-
-6. **apiserver-auth** (5 certificates)
-   - Kubernetes API server authentication
-
-7. **Etcd** (1 certificate)
-   - Core etcd database certificates
-
-8. **Node / Kubelet** (2 certificates)
-   - Core Kubernetes kubelet certificates
-
-9. **RHCOS** (2 certificates)
-   - Red Hat CoreOS system certificates
-
-10. **Bare Metal Hardware Provisioning / cluster-baremetal-operator** (1 certificate)
-    - OpenShift bare metal operator
-
-11. **Cloud Compute / Cloud Controller Manager** (1 certificate)
-    - OpenShift cloud integration
-
-12. **End User** (1 certificate)
-    - User-provided certificates
-
 ## Layered Products with owning-component Annotation
 
 ### **The Service-CA Case**
