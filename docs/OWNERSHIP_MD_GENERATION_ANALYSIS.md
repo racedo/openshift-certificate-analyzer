@@ -212,11 +212,78 @@ The components in ownership.md are **OpenShift core platform components**:
 Certificates from products like:
 - MultiCluster Engine (MCE) - `multicluster-engine` namespace
 - Open Cluster Management (OCM) - `open-cluster-management-*` namespaces
+- MetalLB - `metallb-system` namespace
 
 **Are NOT in ownership.md** because:
 1. These namespaces don't match platform namespace patterns (`openshift-*`, `kubernetes-*`)
 2. They are considered "layered products" - installed on top of OpenShift
 3. They have their own certificate management outside OpenShift's core platform
+
+## Layered Products with owning-component Annotation
+
+### **The Service-CA Case**
+
+**Important Discovery**: Layered products that use Service-CA **DO have** the `openshift.io/owning-component: service-ca` annotation, but they are **still excluded** from ownership.md.
+
+**Example**: MetalLB certificate
+```bash
+oc get secret -n metallb-system frr-k8s-webhook-server-cert -o go-template='{{index .data "tls.crt"}}' | base64 -d | openssl x509 -noout -text
+```
+
+This certificate will have:
+- ✅ `openshift.io/owning-component: service-ca` annotation (added by Service-CA operator)
+- ✅ Service-CA signed certificate
+- ✅ Auto-rotated by Service-CA operator
+- ❌ **NOT in ownership.md** (because `metallb-system` is not a platform namespace)
+
+### **Why This Happens**
+
+1. **Service-CA Adds Annotation Automatically**:
+   - Service-CA operator automatically adds `openshift.io/owning-component: service-ca` to ALL certificates it creates
+   - This happens regardless of namespace
+
+2. **Test Only Collects Platform Namespaces**:
+   - The e2e test uses `GatherCertsFromPlatformNamespaces` (line 81 of `test/extended/operators/certs.go`)
+   - Only certificates in platform namespaces are collected
+   - MetalLB, MCE, OCM are in non-platform namespaces
+
+**From Code** (`test/extended/operators/certs.go` line 81):
+```go
+return certgraphanalysis.GatherCertsFromPlatformNamespaces(ctx, kubeClient,
+    certgraphanalysis.SkipRevisioned,
+    certgraphanalysis.SkipHashed,
+    certgraphanalysis.ElideProxyCADetails,
+    certgraphanalysis.RewritePrimaryCertBundleSecret,
+    certgraphanalysis.RewriteNodeNames(masters, bootstrapHostname),
+    certgraphanalysis.CollectAnnotations(annotationsToCollect...),
+)
+```
+
+### **Is There a Separate Test?**
+
+**Answer: No, there is no separate test for layered products.**
+
+Even though:
+- Service-CA certificates in layered products have the annotation
+- Service-CA properly manages and rotates them
+- They follow the same rotation rules as platform certificates
+
+They are **not tested or tracked** in ownership.md because:
+1. The test explicitly filters to platform namespaces only
+2. There's a `GatherCertsFromAllNamespaces` function available, but it's **not used** in the test
+3. Ownership.md is meant to track **core platform certificates only**
+
+### **Implications**
+
+This means:
+- ✅ Service-CA certificates in layered products are **still properly managed**
+- ✅ They still have the `openshift.io/owning-component: service-ca` annotation
+- ✅ They still auto-rotate using the same 80% rule
+- ❌ They are **not documented** in ownership.md
+- ❌ They are **not validated** by the e2e tests
+- ❌ There is **no enforcement** that layered products maintain annotations
+
+**Conclusion**: The annotation requirement is enforced only for platform namespaces. Layered products using Service-CA get the annotation automatically, but are excluded from tracking and validation.
 
 ## Summary: Requirements Checklist
 
