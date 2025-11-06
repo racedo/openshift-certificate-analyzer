@@ -258,6 +258,40 @@ The `github.com/openshift/library-go/pkg/operator/certrotation` package provides
 
 **Result**: Fully automated rotation - no manual intervention needed once properly integrated.
 
+### Q: How does the refresh period annotation relate to actual certificate rotation?
+
+**A: The annotation is metadata for TLS Registry compliance, not the rotation mechanism itself**
+
+**Important Distinction**:
+
+1. **Actual Rotation** (handled by library-go):
+   - ✅ Rotation happens via library-go's 80% rule logic
+   - ✅ Works automatically when using `RotatedSigningCASecret` or `RotatedSelfSignedCertKeySecret`
+   - ✅ **Does NOT require the annotation** - rotation is independent of metadata
+
+2. **Refresh Period Annotation** (TLS Registry requirement):
+   - 📋 `certificates.openshift.io/refresh-period` is metadata for OpenShift's TLS Registry
+   - 📋 Indicates the operator's **commitment** that rotation is tested and working
+   - 📋 Library-go **automatically adds** this annotation IF the operator passes `refresh` in `AdditionalAnnotations`
+   - 📋 **Missing annotation = TLS Registry violation**, but rotation still works
+
+**How library-go adds the annotation** (from `signer.go:251` and `target.go:290`):
+```go
+tlsAnnotations.RefreshPeriod = refresh.String()  // Set from operator's refresh config
+_ = tlsAnnotations.EnsureTLSMetadataUpdate(&secret.ObjectMeta)  // Adds annotation
+```
+
+**The annotation is only added if**:
+- The operator passes a `refresh` duration to library-go's rotation struct
+- The `AdditionalAnnotations.RefreshPeriod` field is populated
+
+**Key Point**: You can use library-go to rotate certificates properly, but if you don't configure the `refresh` period in `AdditionalAnnotations`, the annotation won't be added. This means:
+- ✅ **Rotation still works** (library-go's 80% rule handles it)
+- ❌ **TLS Registry requirement not met** (annotation missing)
+- ⚠️ **CI tests may fail** (violation tracking in `tls/violations/refresh-period/`)
+
+**Best Practice**: Always configure `AdditionalAnnotations.RefreshPeriod` when using library-go to meet TLS Registry requirements, even though rotation works without it.
+
 ## Key Takeaways
 
 1. **library-go provides the rotation logic** - operators don't implement it themselves
