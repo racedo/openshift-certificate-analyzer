@@ -1,0 +1,418 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cert-status-app
+  labels:
+    app: cert-status-monitor
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cert-checker-script
+  namespace: cert-status-app
+data:
+  check-certs.sh: |
+    #!/bin/bash
+    # OpenShift Certificate Monitor - Working 80% Rotation Logic
+    OUTPUT_FILE="/var/www/html/certs.html"
+    echo "🚀 Starting certificate analysis with working 80% rotation logic..."
+    
+    # Capture dynamic values
+    GENERATED_TIME=$(date)
+    CLUSTER_NAME=$(oc get infrastructure cluster -o jsonpath='{.status.infrastructureName}' 2>/dev/null || echo 'unknown-cluster')
+    echo "📊 Generated: $GENERATED_TIME"
+    echo "🏭 Cluster: $CLUSTER_NAME"
+    
+    # Generate HTML with actual certificate data
+    cat > "$OUTPUT_FILE" << EOF
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>OpenShift Certificate Monitor - Working 80% Rotation</title>
+        <meta http-equiv="refresh" content="300">
+        <style>
+            body { font-family: "RedHatText", Arial, sans-serif; margin: 0; padding: 20px; background-color: #f5f5f5; color: #151515; }
+            .header { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+            .card { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+            .alert { padding: 15px; margin: 15px 0; border-radius: 4px; border-left: 4px solid; }
+            .alert-success { background: #f6ffed; border-left-color: #3e8635; color: #2d5016; }
+            .alert-info { background: #e6f7ff; border-left-color: #0066cc; color: #004080; }
+            .badge { padding: 4px 8px; border-radius: 3px; font-size: 11px; font-weight: bold; }
+            .badge-success { background: #f6ffed; color: #3e8635; border: 1px solid #b7eb8f; }
+            .badge-warning { background: #fffbe6; color: #ad6800; border: 1px solid #ffe58f; }
+            .badge-danger { background: #fff2f0; color: #c9190b; border: 1px solid #ffccc7; }
+            table { width: 100%; border-collapse: collapse; margin: 15px 0; font-size: 13px; }
+            th { background: #f5f5f5; padding: 8px; text-align: left; font-weight: bold; font-size: 12px; }
+            td { padding: 8px; border-bottom: 1px solid #ddd; }
+            tr:hover { background-color: #f9f9f9; }
+            h1 { color: #151515; margin: 0; }
+            h2 { color: #0066cc; margin-top: 0; }
+            .annotations-cell { max-width: 200px; font-size: 11px; line-height: 1.3; }
+            .annotation-item { margin-bottom: 3px; padding: 2px 4px; background: #f8f9fa; border-radius: 2px; border-left: 2px solid #dee2e6; }
+            .annotation-refresh-period { border-left-color: #0066cc; background: #e6f7ff; }
+            .annotation-not-set { color: #ad6800; font-style: italic; }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>🔐 OpenShift Certificate Monitor</h1>
+            <p>Certificate rotation at 80% of lifespan - Working Implementation</p>
+        </div>
+        <div class="alert alert-success">
+            <strong>✅ WORKING 80% ROTATION LOGIC:</strong> Now showing real certificate data with 80% rotation calculations.
+        </div>
+        <div class="alert alert-info">
+            <strong>📊 Generated:</strong> $GENERATED_TIME | <strong>Cluster:</strong> $CLUSTER_NAME
+        </div>
+    EOF
+    
+    # Function to check certificates in a namespace
+    check_namespace_certs() {
+        local namespace="$1"
+        local title="$2"
+        echo "🔍 Checking certificates in $namespace..."
+        
+        cat >> "$OUTPUT_FILE" << EOF
+        <div class="card">
+            <h2>🔐 $title</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Certificate Name</th>
+                        <th>Created</th>
+                        <th>Expires</th>
+                        <th>Lifespan (Days)</th>
+                        <th>Rotation Time (80%)</th>
+                        <th>Status</th>
+                        <th>Annotations</th>
+                    </tr>
+                </thead>
+                <tbody>
+    EOF
+    
+        if ! oc get namespace "$namespace" >/dev/null 2>&1; then
+            cat >> "$OUTPUT_FILE" << EOF
+                    <tr><td colspan="7" style="text-align: center; color: #ad6800;"><span class="badge badge-warning">⚠️ Namespace $namespace not found</span></td></tr>
+    EOF
+        else
+            local cert_found=false
+            local current_epoch=$(date +%s)
+            
+            while IFS= read -r line; do
+                if [[ -z "$line" ]]; then continue; fi
+                cert_found=true
+                local name=$(echo "$line" | awk '{print $1}')
+                local cert_data=$(oc -n "$namespace" get secret "$name" -o go-template='{{index .data "tls.crt"}}' 2>/dev/null)
+                
+                if [[ -n "$cert_data" ]]; then
+                    local cert_decoded=$(echo "$cert_data" | base64 -d 2>/dev/null)
+                    if [[ -n "$cert_decoded" ]]; then
+                        local not_before=$(echo "$cert_decoded" | openssl x509 -noout -startdate 2>/dev/null | cut -d= -f2 | sed 's/^ *//')
+                        local not_after=$(echo "$cert_decoded" | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2 | sed 's/^ *//')
+                        
+                        if [[ -n "$not_before" && -n "$not_after" ]]; then
+                            local before_epoch=$(date -d "$not_before" +%s 2>/dev/null)
+                            local after_epoch=$(date -d "$not_after" +%s 2>/dev/null)
+                            
+                            if [[ -n "$before_epoch" && -n "$after_epoch" ]]; then
+                                # Calculate lifespan and rotation
+                                local total_lifespan=$((after_epoch - before_epoch))
+                                local lifespan_days=$((total_lifespan / 86400))
+                                
+                                local rotation_lifespan=$((total_lifespan * 80 / 100))
+                                local rotation_epoch=$((before_epoch + rotation_lifespan))
+                                
+                                local created_date=$(date -d "$not_before" "+%m/%d/%Y" 2>/dev/null || echo "Unknown")
+                                local expiry_date=$(date -d "$not_after" "+%m/%d/%Y" 2>/dev/null || echo "Unknown")
+                                
+                                # Calculate status
+                                local days_until_rotation=$(( (rotation_epoch - current_epoch) / 86400 ))
+                                local days_until_expiry=$(( (after_epoch - current_epoch) / 86400 ))
+                                
+                                # Determine status badge and rotation text
+                                local status_badge=""
+                                local rotation_text=""
+                                
+                                if [[ $rotation_epoch -le $current_epoch ]]; then
+                                    local overdue_days=$(( (current_epoch - rotation_epoch) / 86400 ))
+                                    status_badge="<span class=\"badge badge-danger\">🔴 Overdue $overdue_days days</span>"
+                                    rotation_text="Should have rotated"
+                                elif [[ $days_until_rotation -le 30 ]]; then
+                                    local rotation_date=$(date -d "@$rotation_epoch" "+%m/%d/%Y" 2>/dev/null || echo "Unknown")
+                                    status_badge="<span class=\"badge badge-warning\">🟡 ${days_until_rotation}d to rotation</span>"
+                                    rotation_text="$rotation_date"
+                                else
+                                    local rotation_date=$(date -d "@$rotation_epoch" "+%m/%d/%Y" 2>/dev/null || echo "Unknown")
+                                    status_badge="<span class=\"badge badge-success\">🟢 ${days_until_rotation}d to rotation</span>"
+                                    rotation_text="$rotation_date"
+                                fi
+                                
+                                # Process annotations - show ALL annotations
+                                local annotations_html=""
+                                local refresh_period_found=false
+                                
+                                # Get all annotations using a more robust approach
+                                local all_annotations=$(oc -n "$namespace" get secret "$name" -o jsonpath='{.metadata.annotations}' 2>/dev/null)
+                                
+                                if [[ -n "$all_annotations" && "$all_annotations" != "{}" ]]; then
+                                    # Parse annotations using a different approach that works in bash
+                                    local temp_file=$(mktemp)
+                                    echo "$all_annotations" | sed 's/[{}]//g' | sed 's/","/\n/g' | sed 's/":/\n/g' > "$temp_file"
+                                    
+                                    while IFS=':' read -r key value; do
+                                        if [[ -n "$key" && -n "$value" ]]; then
+                                            # Clean up key and value
+                                            key=$(echo "$key" | sed 's/.*"//g' | sed 's/\"//g' | sed 's/^"//g')
+                                            value=$(echo "$value" | sed 's/^"//g' | sed 's/".*//g')
+                                            
+                                            # Check if this is refresh-period
+                                            if [[ "$key" == "certificates.openshift.io/refresh-period" ]]; then
+                                                refresh_period_found=true
+                                                annotations_html+="<div class=\"annotation-item annotation-refresh-period\"><strong>refresh-period:</strong> $value</div>"
+                                            else
+                                                # Truncate long values for display
+                                                if [[ ${#value} -gt 30 ]]; then
+                                                    value="${value:0:27}..."
+                                                fi
+                                                annotations_html+="<div class=\"annotation-item\"><strong>$key:</strong> $value</div>"
+                                            fi
+                                        fi
+                                    done < "$temp_file"
+                                    rm -f "$temp_file"
+                                fi
+                                
+                                # Add "not set" for refresh-period if not found
+                                if [[ "$refresh_period_found" == false ]]; then
+                                    annotations_html+="<div class=\"annotation-item annotation-not-set\"><strong>refresh-period:</strong> not set</div>"
+                                fi
+                                
+                                # If no annotations at all
+                                if [[ -z "$annotations_html" ]]; then
+                                    annotations_html="<div class=\"annotation-not-set\">No annotations</div>"
+                                fi
+                                
+                                cat >> "$OUTPUT_FILE" << EOF
+                    <tr>
+                        <td><strong>$name</strong></td>
+                        <td>$created_date</td>
+                        <td>$expiry_date<br><small>($days_until_expiry days left)</small></td>
+                        <td>$lifespan_days</td>
+                        <td>$rotation_text<br><small>($days_until_rotation days)</small></td>
+                        <td>$status_badge</td>
+                        <td class="annotations-cell">$annotations_html</td>
+                    </tr>
+    EOF
+                            else
+                                cat >> "$OUTPUT_FILE" << EOF
+                    <tr><td><strong>$name</strong></td><td colspan="6"><span class="badge badge-warning">⚠️ Date parse error</span></td></tr>
+    EOF
+                            fi
+                        else
+                            cat >> "$OUTPUT_FILE" << EOF
+                    <tr><td><strong>$name</strong></td><td colspan="6"><span class="badge badge-warning">⚠️ Certificate parse error</span></td></tr>
+    EOF
+                        fi
+                    else
+                        cat >> "$OUTPUT_FILE" << EOF
+                    <tr><td><strong>$name</strong></td><td colspan="6"><span class="badge badge-warning">⚠️ Base64 decode error</span></td></tr>
+    EOF
+                    fi
+                else
+                    cat >> "$OUTPUT_FILE" << EOF
+                    <tr><td><strong>$name</strong></td><td colspan="6"><span class="badge badge-warning">⚠️ No certificate data</span></td></tr>
+    EOF
+                fi
+            done < <(oc -n "$namespace" get secrets --no-headers -o custom-columns="NAME:.metadata.name,TYPE:.type" 2>/dev/null | grep kubernetes.io/tls | head -10)
+            
+            if [[ "$cert_found" == false ]]; then
+                cat >> "$OUTPUT_FILE" << EOF
+                    <tr><td colspan="7" style="text-align: center; color: #ad6800;"><span class="badge badge-warning">⚠️ No TLS certificates found in this namespace</span></td></tr>
+    EOF
+            fi
+        fi
+    
+        cat >> "$OUTPUT_FILE" << EOF
+                </tbody>
+            </table>
+        </div>
+    EOF
+    }
+    
+    # Check critical OpenShift certificate namespaces
+    check_namespace_certs "openshift-etcd" "ETCD Certificates"
+    check_namespace_certs "openshift-kube-apiserver" "API Server Certificates"
+    check_namespace_certs "openshift-authentication" "OAuth Certificates"
+    check_namespace_certs "openshift-image-registry" "Registry Certificates"
+    check_namespace_certs "kube-system" "Bootstrap Certificates"
+    check_namespace_certs "openshift-node" "Kubelet Certificates"
+    
+    # Check other important certificate namespaces
+    check_namespace_certs "openshift-service-ca" "Service CA Certificates"
+    check_namespace_certs "openshift-ingress" "Ingress Router Certificates"
+    check_namespace_certs "openshift-monitoring" "Monitoring & Metrics Certificates"
+    check_namespace_certs "openshift-console" "Console Certificates"
+    check_namespace_certs "openshift-ovn-kubernetes" "Network Certificates"
+    check_namespace_certs "openshift-machine-config-operator" "Machine Config Certificates"
+    
+    cat >> "$OUTPUT_FILE" << EOF
+        <div style="margin-top: 30px; padding: 20px; background-color: white; border-top: 1px solid #ddd; text-align: center; color: #6a6e73; font-size: 12px;">
+            <p>OpenShift Certificate Monitor | Auto-refresh every 5 minutes</p>
+            <p><strong>Rotation Logic:</strong> 80% of certificate lifespan (creation to expiry)</p>
+            <p><strong>No ValidityDuration assumptions</strong> - Uses actual certificate data</p>
+            <p><strong>Annotations:</strong> Shows certificates.openshift.io/refresh-period when available</p>
+        </div>
+        <script>setTimeout(function() { window.location.reload(); }, 300000);</script>
+    </body>
+    </html>
+    EOF
+    
+    echo "✅ Certificate status HTML generated with working 80% rotation logic at: $OUTPUT_FILE"
+    echo "🔄 Showing real certificate data with 80% rotation calculations and annotations"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cert-status-app
+  namespace: cert-status-app
+  labels:
+    app: cert-status-monitor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cert-status-monitor
+  template:
+    metadata:
+      labels:
+        app: cert-status-monitor
+    spec:
+      serviceAccountName: cert-monitor-sa
+      imagePullSecrets:
+      - name: pull-secret
+      containers:
+      - name: httpd
+        image: registry.redhat.io/rhel8/httpd-24:latest
+        ports:
+        - containerPort: 8080
+        volumeMounts:
+        - name: html-content
+          mountPath: /var/www/html
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+      - name: cert-updater
+        image: registry.redhat.io/openshift4/ose-cli:latest
+        command: ["/bin/bash"]
+        args: ["-c", "set -e; echo 'Starting cert-updater container...'; cat > /var/www/html/index.html << 'EOF'
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Certificate Monitor</title>
+    <meta http-equiv=\"refresh\" content=\"5; url=certs.html\">
+</head>
+<body>
+    <h1>Certificate Monitor</h1>
+    <p>Redirecting to <a href=\"certs.html\">certificate status</a>...</p>
+</body>
+</html>
+EOF
+echo 'Created index.html'; if [[ -f /scripts/check-certs.sh ]]; then echo 'Script found, making executable...'; chmod +x /scripts/check-certs.sh; else echo 'Script not found at /scripts/check-certs.sh'; ls -la /scripts/; exit 1; fi; echo 'Starting certificate monitoring loop...'; while true; do echo \"Running certificate check at \$(date)\"; /scripts/check-certs.sh || echo \"Script failed, continuing...\"; echo \"Sleeping for 300 seconds...\"; sleep 300; done"]
+        volumeMounts:
+        - name: html-content
+          mountPath: /var/www/html
+        - name: cert-checker-script
+          mountPath: /scripts
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+      volumes:
+      - name: html-content
+        emptyDir: {}
+      - name: cert-checker-script
+        configMap:
+          name: cert-checker-script
+          defaultMode: 0755
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cert-monitor-sa
+  namespace: cert-status-app
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cert-monitor-role
+rules:
+- apiGroups: [""]
+  resources: ["secrets", "namespaces"]
+  verbs: ["get", "list"]
+- apiGroups: ["config.openshift.io"]
+  resources: ["infrastructures"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cert-monitor-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cert-monitor-role
+subjects:
+- kind: ServiceAccount
+  name: cert-monitor-sa
+  namespace: cert-status-app
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cert-status-service
+  namespace: cert-status-app
+  labels:
+    app: cert-status-monitor
+spec:
+  selector:
+    app: cert-status-monitor
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
+  type: ClusterIP
+
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: cert-status-route
+  namespace: cert-status-app
+  labels:
+    app: cert-status-monitor
+spec:
+  to:
+    kind: Service
+    name: cert-status-service
+    weight: 100
+  port:
+    targetPort: 8080
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None

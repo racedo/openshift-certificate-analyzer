@@ -1,0 +1,75 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hello-world-test
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-world
+  namespace: hello-world-test
+  labels:
+    app: hello-world
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hello-world
+  template:
+    metadata:
+      labels:
+        app: hello-world
+    spec:
+      containers:
+      - name: hello-world
+        image: registry.redhat.io/ubi8/ubi-minimal:latest
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          echo "Hello World from $(hostname)!" > /tmp/index.html
+          while true; do
+            echo "HTTP/1.1 200 OK" > /tmp/response
+            echo "Content-Type: text/html" >> /tmp/response
+            echo "Content-Length: $(wc -c < /tmp/index.html)" >> /tmp/response
+            echo "" >> /tmp/response
+            cat /tmp/index.html >> /tmp/response
+            nc -l -p 8080 < /tmp/response
+          done
+        ports:
+        - containerPort: 8080
+        resources:
+          limits:
+            cpu: 100m
+            memory: 128Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello-world-service
+  namespace: hello-world-test
+  labels:
+    app: hello-world
+spec:
+  ports:
+  - port: 8080
+    targetPort: 8080
+  selector:
+    app: hello-world
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: hello-world-route
+  namespace: hello-world-test
+  labels:
+    app: hello-world
+spec:
+  to:
+    kind: Service
+    name: hello-world-service
+  port:
+    targetPort: 8080

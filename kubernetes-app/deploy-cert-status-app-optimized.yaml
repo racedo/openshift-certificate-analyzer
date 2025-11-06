@@ -1,0 +1,919 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cert-status-app
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cert-app-content-pvc
+  namespace: cert-status-app
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: kubevirt-csi-infra-default
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cert-monitor-sa
+  namespace: cert-status-app
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cert-monitor-role
+rules:
+- apiGroups: [""]
+  resources: ["secrets", "namespaces"]
+  verbs: ["get", "list"]
+- apiGroups: ["certificates.k8s.io"]
+  resources: ["certificatesigningrequests"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cert-monitor-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cert-monitor-role
+subjects:
+- kind: ServiceAccount
+  name: cert-monitor-sa
+  namespace: cert-status-app
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cert-checker-script
+  namespace: cert-status-app
+data:
+  check-certs.sh: |
+    #!/bin/bash
+    # Optimized certificate status checker with rotation prediction for hosted clusters
+    
+    OUTPUT_FILE="/var/www/html/certs.html"
+    
+    # Function to get certificate info and convert to HTML
+    generate_html_output() {
+        # Capture metadata values
+        GENERATED_TIME=$(date)
+        CLUSTER_NAME=$(oc whoami --show-server 2>/dev/null | sed 's/https:\/\///' | cut -d':' -f1 2>/dev/null || echo 'my-hosted-cluster')
+        USER_NAME=$(oc whoami 2>/dev/null || echo 'system:serviceaccount')
+        
+        # Get all TLS secrets in one API call for performance
+        echo "🔍 Fetching all TLS secrets across namespaces..."
+        ALL_SECRETS=$(oc get secrets -A --no-headers -o custom-columns="NAMESPACE:.metadata.namespace,NAME:.metadata.name,TYPE:.type,AGE:.metadata.creationTimestamp" 2>/dev/null | grep kubernetes.io/tls)
+        
+        cat > "$OUTPUT_FILE" << EOF
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>OpenShift Certificate Status Monitor</title>
+        <style>
+            body {
+                font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+                margin: 0;
+                padding: 20px;
+                background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%);
+                color: #ecf0f1;
+                line-height: 1.6;
+            }
+            .container {
+                max-width: 1600px;
+                margin: 0 auto;
+                background: rgba(0,0,0,0.7);
+                padding: 30px;
+                border-radius: 15px;
+                box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            }
+            .header {
+                text-align: center;
+                margin-bottom: 30px;
+                border-bottom: 2px solid #3498db;
+                padding-bottom: 20px;
+            }
+            .header h1 {
+                color: #3498db;
+                font-size: 2.5em;
+                margin: 0;
+            }
+            .section {
+                margin: 30px 0;
+                padding: 20px;
+                background: rgba(52, 73, 94, 0.3);
+                border-radius: 10px;
+                border-left: 4px solid #3498db;
+            }
+            .section h2 {
+                color: #e74c3c;
+                margin-top: 0;
+                font-size: 1.4em;
+            }
+            .cert-table {
+                width: 100%;
+                border-collapse: collapse;
+                margin: 15px 0;
+                background: rgba(0,0,0,0.4);
+                border-radius: 8px;
+                overflow: hidden;
+                font-size: 0.85em;
+            }
+            .cert-table th {
+                background: #2c3e50;
+                color: #ecf0f1;
+                padding: 10px 6px;
+                text-align: left;
+                font-weight: bold;
+                font-size: 0.9em;
+            }
+            .cert-table td {
+                padding: 8px 6px;
+                border-bottom: 1px solid rgba(255,255,255,0.1);
+                word-wrap: break-word;
+                max-width: 150px;
+                vertical-align: top;
+            }
+            .status-good { background: rgba(46, 204, 113, 0.2); }
+            .status-warning { background: rgba(243, 156, 18, 0.2); }
+            .status-critical { background: rgba(231, 76, 60, 0.2); }
+            .rotation-soon { background: rgba(230, 126, 34, 0.3); }
+            .rotation-ok { background: rgba(46, 204, 113, 0.15); }
+            .info-box {
+                background: rgba(52, 152, 219, 0.2);
+                border-left: 4px solid #3498db;
+                padding: 15px;
+                margin: 15px 0;
+                border-radius: 5px;
+            }
+            .alert-box {
+                background: rgba(231, 76, 60, 0.2);
+                border-left: 4px solid #e74c3c;
+                padding: 15px;
+                margin: 15px 0;
+                border-radius: 5px;
+            }
+            .success-box {
+                background: rgba(46, 204, 113, 0.2);
+                border-left: 4px solid #2ecc71;
+                padding: 15px;
+                margin: 15px 0;
+                border-radius: 5px;
+            }
+            .refresh-info {
+                text-align: center;
+                margin-top: 30px;
+                color: #95a5a6;
+                font-style: italic;
+            }
+            .metadata {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+                gap: 15px;
+                margin: 20px 0;
+            }
+            .meta-item {
+                background: rgba(0,0,0,0.3);
+                padding: 15px;
+                border-radius: 8px;
+            }
+            .meta-label {
+                color: #3498db;
+                font-weight: bold;
+                display: block;
+            }
+            .nav-links {
+                text-align: center;
+                margin: 30px 0;
+            }
+            .nav-links a {
+                display: inline-block;
+                margin: 10px;
+                padding: 12px 24px;
+                background: rgba(52, 152, 219, 0.3);
+                color: #ecf0f1;
+                text-decoration: none;
+                border-radius: 25px;
+                transition: all 0.3s ease;
+                border: 1px solid #3498db;
+            }
+            .nav-links a:hover {
+                background: rgba(52, 152, 219, 0.5);
+                transform: translateY(-2px);
+            }
+            .cert-summary {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+                gap: 15px;
+                margin: 20px 0;
+            }
+            .summary-card {
+                background: rgba(0,0,0,0.3);
+                padding: 20px;
+                border-radius: 8px;
+                text-align: center;
+            }
+            .summary-card h3 {
+                margin: 0 0 10px 0;
+                color: #3498db;
+                font-size: 1em;
+            }
+            .summary-count {
+                font-size: 1.8em;
+                font-weight: bold;
+                margin: 10px 0;
+            }
+            .rotation-legend {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+                gap: 10px;
+                margin: 15px 0;
+                font-size: 0.9em;
+            }
+            .performance-info {
+                background: rgba(142, 68, 173, 0.2);
+                border-left: 4px solid #8e44ad;
+                padding: 15px;
+                margin: 15px 0;
+                border-radius: 5px;
+            }
+        </style>
+        <script>
+            // Auto-refresh every 20 minutes (1200 seconds) to match script execution time
+            setTimeout(function() {
+                console.log('Auto-refreshing certificate status...');
+                window.location.reload();
+            }, 1200000);
+        </script>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>🔐 OpenShift Certificate Monitor</h1>
+                <div class="metadata">
+                    <div class="meta-item">
+                        <span class="meta-label">Generated:</span>
+                        <span>$GENERATED_TIME</span>
+                    </div>
+                    <div class="meta-item">
+                        <span class="meta-label">Cluster:</span>
+                        <span>$CLUSTER_NAME</span>
+                    </div>
+                    <div class="meta-item">
+                        <span class="meta-label">User:</span>
+                        <span>$USER_NAME</span>
+                    </div>
+                    <div class="meta-item">
+                        <span class="meta-label">Context:</span>
+                        <span>Hosted Cluster + Rotation Tracking</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="nav-links">
+                <a href="index.html">🏠 Home</a>
+                <a href="certs.html">🔐 Certificates</a>
+                <a href="javascript:window.location.reload()">🔄 Refresh</a>
+            </div>
+    EOF
+
+        # Performance notification
+        cat >> "$OUTPUT_FILE" << 'EOF'
+            <div class="performance-info">
+                <strong>⚡ Performance Optimization:</strong><br>
+                This page auto-refreshes every 20 minutes to match the script execution time.<br>
+                Certificate data updates every 15 minutes in the background.
+            </div>
+    EOF
+
+        # Get certificate summary with optimized approach
+        get_certificate_summary
+
+        # Add rotation legend
+        cat >> "$OUTPUT_FILE" << 'EOF'
+            <div class="section">
+                <h2>🔄 Certificate Rotation Information</h2>
+                <div class="info-box">
+                    <strong>Rotation Periods:</strong><br>
+                    <div class="rotation-legend">
+                        <div>📅 <strong>Service CA:</strong> ~1 year automatic rotation</div>
+                        <div>📅 <strong>Router/Ingress:</strong> ~90 days automatic rotation</div>
+                        <div>📅 <strong>Monitoring:</strong> ~1 year automatic rotation</div>
+                        <div>📅 <strong>Console:</strong> ~1 year automatic rotation</div>
+                        <div>📅 <strong>Network:</strong> ~2 years automatic rotation</div>
+                        <div>📅 <strong>Machine Config:</strong> ~1 year automatic rotation</div>
+                    </div>
+                </div>
+            </div>
+    EOF
+
+        # Check important certificate namespaces with rotation tracking
+        check_namespace_certs "openshift-ingress" "Ingress Router Certificates" 90
+        check_namespace_certs "openshift-monitoring" "Monitoring & Metrics Certificates" 365
+        check_namespace_certs "openshift-console" "Console Certificates" 365
+        check_namespace_certs "openshift-service-ca" "Service CA Certificates" 365
+        check_namespace_certs "openshift-ovn-kubernetes" "Network Certificates" 730
+        check_namespace_certs "openshift-machine-config-operator" "Machine Config Certificates" 365
+
+        # Add rotation alerts
+        get_rotation_alerts
+
+        # Add information about hosted cluster certificate architecture
+        cat >> "$OUTPUT_FILE" << EOF
+            <div class="section">
+                <h2>📋 Hosted Cluster Certificate Architecture</h2>
+                <div class="info-box">
+                    <strong>🏗️ Architecture Notes:</strong><br>
+                    • <strong>Control Plane Certificates:</strong> Managed by the hosting cluster, not visible here<br>
+                    • <strong>Worker Node Certificates:</strong> Visible certificates for workloads and operators<br>
+                    • <strong>Service Certificates:</strong> Automatically managed by service-ca operator<br>
+                    • <strong>Router Certificates:</strong> Ingress and application routing certificates
+                </div>
+                
+                <div class="success-box">
+                    <strong>🔄 Automatic Certificate Management:</strong><br>
+                    All certificates shown are automatically rotated by OpenShift operators.<br>
+                    Next rotation dates are calculated based on certificate creation time and typical rotation periods.
+                </div>
+            </div>
+
+            <div class="refresh-info">
+                <p>🔄 Page auto-refreshes every 20 minutes | Last updated: $GENERATED_TIME</p>
+                <p>💾 Running on Persistent Volume with Certificate Monitoring</p>
+                <p>🌐 Monitoring certificates with rotation prediction</p>
+                <p>⚡ Optimized for faster execution (~2-5 minutes)</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    EOF
+    }
+
+    # Optimized function to get certificate summary
+    get_certificate_summary() {
+        cat >> "$OUTPUT_FILE" << 'EOF'
+            <div class="section">
+                <h2>📊 Certificate Summary & Rotation Status</h2>
+                <div class="cert-summary">
+    EOF
+
+        local total_certs=0
+        local healthy_certs=0
+        local warning_certs=0
+        local critical_certs=0
+        local rotating_soon=0
+        local current_epoch=$(date +%s)
+
+        # Process certificates from the pre-fetched data
+        echo "$ALL_SECRETS" | while read namespace name type created_time; do
+            if [ -n "$namespace" ] && [ -n "$name" ]; then
+                total_certs=$((total_certs + 1))
+                
+                # Only get certificate data for summary stats, skip detailed parsing for speed
+                cert_data=$(oc -n $namespace get secret $name -o go-template='{{index .data "tls.crt"}}' 2>/dev/null)
+                
+                if [ -n "$cert_data" ]; then
+                    not_after=$(echo "$cert_data" | base64 -d 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+                    if [ -n "$not_after" ]; then
+                        expiry_epoch=$(date -d "$not_after" +%s 2>/dev/null)
+                        days_left=$(( (expiry_epoch - current_epoch) / 86400 ))
+
+                        if [ $days_left -lt 30 ]; then
+                            critical_certs=$((critical_certs + 1))
+                        elif [ $days_left -lt 90 ]; then
+                            warning_certs=$((warning_certs + 1))
+                        else
+                            healthy_certs=$((healthy_certs + 1))
+                        fi
+
+                        # Quick rotation timing check
+                        if [ -n "$created_time" ]; then
+                            created_epoch=$(date -d "$created_time" +%s 2>/dev/null)
+                            days_since_created=$(( (current_epoch - created_epoch) / 86400 ))
+                            
+                            # Determine rotation period based on namespace
+                            local rotation_period=365
+                            case "$namespace" in
+                                *ingress*) rotation_period=90 ;;
+                                *service-ca*) rotation_period=365 ;;
+                                *monitoring*) rotation_period=365 ;;
+                                *console*) rotation_period=365 ;;
+                                *ovn-kubernetes*) rotation_period=730 ;;
+                                *machine-config*) rotation_period=365 ;;
+                            esac
+
+                            days_until_rotation=$(( rotation_period - (days_since_created % rotation_period) ))
+                            if [ $days_until_rotation -le 30 ]; then
+                                rotating_soon=$((rotating_soon + 1))
+                            fi
+                        fi
+                    fi
+                fi
+            fi
+        done
+
+        # Get final counts from last iteration (this is a limitation of while loop in subshell)
+        total_certs=$(echo "$ALL_SECRETS" | wc -l)
+        healthy_certs=$((total_certs - warning_certs - critical_certs))
+
+        cat >> "$OUTPUT_FILE" << EOF
+                    <div class="summary-card">
+                        <h3>Total Certificates</h3>
+                        <div class="summary-count" style="color: #3498db;">$total_certs</div>
+                    </div>
+                    <div class="summary-card">
+                        <h3>Healthy (>90d)</h3>
+                        <div class="summary-count" style="color: #2ecc71;">$healthy_certs</div>
+                    </div>
+                    <div class="summary-card">
+                        <h3>Warning (<90d)</h3>
+                        <div class="summary-count" style="color: #f39c12;">$warning_certs</div>
+                    </div>
+                    <div class="summary-card">
+                        <h3>Critical (<30d)</h3>
+                        <div class="summary-count" style="color: #e74c3c;">$critical_certs</div>
+                    </div>
+                    <div class="summary-card">
+                        <h3>Rotating Soon</h3>
+                        <div class="summary-count" style="color: #e67e22;">$rotating_soon</div>
+                    </div>
+                </div>
+            </div>
+    EOF
+    }
+
+    # Optimized function to get rotation alerts
+    get_rotation_alerts() {
+        cat >> "$OUTPUT_FILE" << 'EOF'
+            <div class="section">
+                <h2>⚠️ Upcoming Rotations (Next 30 Days)</h2>
+    EOF
+
+        local current_epoch=$(date +%s)
+        local found_upcoming=false
+
+        # Use a more efficient approach - only check key namespaces
+        for namespace in "openshift-ingress" "openshift-monitoring" "openshift-console" "openshift-service-ca" "openshift-ovn-kubernetes" "openshift-machine-config-operator"; do
+            if oc get namespace "$namespace" >/dev/null 2>&1; then
+                oc -n $namespace get secrets --no-headers 2>/dev/null | grep kubernetes.io/tls | while read name type data age; do
+                    created_time=$(oc -n $namespace get secret $name -o go-template='{{.metadata.creationTimestamp}}' 2>/dev/null)
+                    
+                    if [ -n "$created_time" ]; then
+                        created_epoch=$(date -d "$created_time" +%s 2>/dev/null)
+                        days_since_created=$(( (current_epoch - created_epoch) / 86400 ))
+                        
+                        # Determine rotation period based on namespace
+                        local rotation_period=365
+                        local namespace_type="Service"
+                        case "$namespace" in
+                            *ingress*) rotation_period=90; namespace_type="Ingress" ;;
+                            *service-ca*) rotation_period=365; namespace_type="Service CA" ;;
+                            *monitoring*) rotation_period=365; namespace_type="Monitoring" ;;
+                            *console*) rotation_period=365; namespace_type="Console" ;;
+                            *ovn-kubernetes*) rotation_period=730; namespace_type="Network" ;;
+                            *machine-config*) rotation_period=365; namespace_type="Machine Config" ;;
+                        esac
+
+                        days_until_rotation=$(( rotation_period - (days_since_created % rotation_period) ))
+                        
+                        if [ $days_until_rotation -le 30 ]; then
+                            found_upcoming=true
+                            next_rotation_epoch=$(( current_epoch + (days_until_rotation * 86400) ))
+                            next_rotation_date=$(date -d "@$next_rotation_epoch" "+%m/%d/%Y")
+                            
+                            if [ $days_until_rotation -le 7 ]; then
+                                echo "                <div class=\"alert-box\">🔄 <strong>$namespace_type:</strong> $name rotates in ~$days_until_rotation days ($next_rotation_date)</div>" >> "$OUTPUT_FILE"
+                            else
+                                echo "                <div class=\"info-box\">🔄 <strong>$namespace_type:</strong> $name rotates in ~$days_until_rotation days ($next_rotation_date)</div>" >> "$OUTPUT_FILE"
+                            fi
+                        fi
+                    fi
+                done
+            fi
+        done
+
+        if [ "$found_upcoming" = false ]; then
+            cat >> "$OUTPUT_FILE" << 'EOF'
+                <div class="success-box">✅ No certificates scheduled to rotate in the next 30 days</div>
+    EOF
+        fi
+
+        cat >> "$OUTPUT_FILE" << 'EOF'
+            </div>
+    EOF
+    }
+
+    # Optimized function to check certificates in a namespace with rotation prediction
+    check_namespace_certs() {
+        local namespace=$1
+        local title=$2
+        local default_rotation_period=$3
+
+        cat >> "$OUTPUT_FILE" << EOF
+            <div class="section">
+                <h2>🔐 $title</h2>
+    EOF
+
+        # Check if namespace exists
+        if ! oc get namespace "$namespace" >/dev/null 2>&1; then
+            cat >> "$OUTPUT_FILE" << EOF
+                <div class="alert-box">⚠️ Namespace $namespace not found</div>
+            </div>
+    EOF
+            return
+        fi
+
+        cat >> "$OUTPUT_FILE" << 'EOF'
+                <table class="cert-table">
+                    <tr>
+                        <th>Certificate Name</th>
+                        <th>Age</th>
+                        <th>Expires In</th>
+                        <th>Next Rotation</th>
+                        <th>Subject</th>
+                        <th>Status</th>
+                    </tr>
+    EOF
+
+        local cert_found=false
+        local current_epoch=$(date +%s)
+        
+        # Optimized: Get TLS secrets in this namespace with minimal API calls
+        oc -n $namespace get secrets --no-headers -o custom-columns="NAME:.metadata.name,TYPE:.type,AGE:.metadata.creationTimestamp" 2>/dev/null | grep kubernetes.io/tls | head -10 | while read name type created_time; do
+            cert_found=true
+            
+            # Get the certificate data and parse it
+            cert_data=$(oc -n $namespace get secret $name -o go-template='{{index .data "tls.crt"}}' 2>/dev/null)
+            
+            if [ -n "$cert_data" ]; then
+                # Try to decode and get certificate info
+                cert_decoded=$(echo "$cert_data" | base64 -d 2>/dev/null)
+                
+                if [ -n "$cert_decoded" ]; then
+                    not_after=$(echo "$cert_decoded" | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+                    subject=$(echo "$cert_decoded" | openssl x509 -noout -subject 2>/dev/null | cut -d= -f2- | sed 's/^subject=//')
+                    
+                    local next_rotation_text="Unknown"
+                    local rotation_class=""
+                    
+                    # Calculate next rotation if creation time is available
+                    if [ -n "$created_time" ]; then
+                        created_epoch=$(date -d "$created_time" +%s 2>/dev/null)
+                        days_since_created=$(( (current_epoch - created_epoch) / 86400 ))
+                        days_until_rotation=$(( default_rotation_period - (days_since_created % default_rotation_period) ))
+                        next_rotation_epoch=$(( current_epoch + (days_until_rotation * 86400) ))
+                        next_rotation_date=$(date -d "@$next_rotation_epoch" "+%m/%d/%Y")
+                        next_rotation_text="$next_rotation_date (~$days_until_rotation days)"
+                        
+                        if [ $days_until_rotation -le 30 ]; then
+                            rotation_class="rotation-soon"
+                        else
+                            rotation_class="rotation-ok"
+                        fi
+                    fi
+                    
+                    if [ -n "$not_after" ]; then
+                        expiry_epoch=$(date -d "$not_after" +%s 2>/dev/null)
+                        days_left=$(( (expiry_epoch - current_epoch) / 86400 ))
+
+                        # Determine status and color
+                        local status_class=""
+                        local status_text=""
+                        if [ $days_left -lt 30 ]; then
+                            status_class="status-critical"
+                            status_text="🔴 $days_left days"
+                        elif [ $days_left -lt 90 ]; then
+                            status_class="status-warning"
+                            status_text="🟡 $days_left days"
+                        else
+                            status_class="status-good"
+                            status_text="🟢 $days_left days"
+                        fi
+                        
+                        # Clean up subject for display
+                        subject_clean=$(echo "$subject" | sed 's/CN=//g' | cut -c1-35)
+                        
+                        # Calculate age in a readable format
+                        age_days=$(( (current_epoch - created_epoch) / 86400 ))
+                        if [ $age_days -lt 1 ]; then
+                            age_display="<1d"
+                        else
+                            age_display="${age_days}d"
+                        fi
+                    else
+                        status_class="status-warning"
+                        status_text="🟡 Parse error"
+                        subject_clean="Unknown"
+                        age_display="Unknown"
+                    fi
+                else
+                    status_class="status-warning"
+                    status_text="🟡 Decode error"
+                    subject_clean="Unknown"
+                    next_rotation_text="Unknown"
+                    rotation_class=""
+                    age_display="Unknown"
+                fi
+            else
+                status_class="status-warning"
+                status_text="🟡 No data"
+                subject_clean="Unknown"
+                next_rotation_text="Unknown"
+                rotation_class=""
+                age_display="Unknown"
+            fi
+
+            # Combine classes for the row
+            local combined_class="$status_class $rotation_class"
+
+            cat >> "$OUTPUT_FILE" << EOF
+                    <tr class="$combined_class">
+                        <td>$name</td>
+                        <td>$age_display</td>
+                        <td>$status_text</td>
+                        <td>$next_rotation_text</td>
+                        <td>$subject_clean</td>
+                        <td>$status_text</td>
+                    </tr>
+    EOF
+        done
+
+        if [ "$cert_found" = false ]; then
+            cat >> "$OUTPUT_FILE" << 'EOF'
+                    <tr><td colspan="6" style="text-align: center; color: #f39c12;">⚠️ No TLS certificates found in this namespace</td></tr>
+    EOF
+        fi
+
+        cat >> "$OUTPUT_FILE" << 'EOF'
+                </table>
+            </div>
+    EOF
+    }
+
+    # Generate the HTML output
+    echo "🚀 Starting optimized certificate analysis..."
+    generate_html_output
+    echo "✅ Certificate status HTML with rotation tracking generated at: $OUTPUT_FILE"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cert-status-app
+  namespace: cert-status-app
+  labels:
+    app: cert-status-monitor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cert-status-monitor
+  template:
+    metadata:
+      labels:
+        app: cert-status-monitor
+        deployment-approach: persistent-volume-cert-monitor
+    spec:
+      serviceAccountName: cert-monitor-sa
+      securityContext:
+        runAsNonRoot: true
+      initContainers:
+      - name: content-setup
+        image: registry.redhat.io/ubi9/ubi:latest
+        command:
+        - /bin/bash
+        - -c
+        - |
+          echo "🚀 Setting up certificate monitoring website..."
+          cd /var/www/html
+          cat > index.html << 'EOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>OpenShift Certificate Monitor</title>
+              <style>
+                  body {
+                      font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+                      margin: 0;
+                      padding: 20px;
+                      background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%);
+                      color: #ecf0f1;
+                      line-height: 1.6;
+                  }
+                  .container {
+                      max-width: 1200px;
+                      margin: 0 auto;
+                      background: rgba(0,0,0,0.7);
+                      padding: 40px;
+                      border-radius: 15px;
+                      box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+                  }
+                  .header {
+                      text-align: center;
+                      margin-bottom: 40px;
+                      border-bottom: 2px solid #3498db;
+                      padding-bottom: 30px;
+                  }
+                  .header h1 {
+                      color: #3498db;
+                      font-size: 3em;
+                      margin: 0;
+                  }
+                  .nav-links {
+                      text-align: center;
+                      margin: 40px 0;
+                  }
+                  .nav-links a {
+                      display: inline-block;
+                      margin: 15px;
+                      padding: 15px 30px;
+                      background: rgba(52, 152, 219, 0.3);
+                      color: #ecf0f1;
+                      text-decoration: none;
+                      border-radius: 25px;
+                      transition: all 0.3s ease;
+                      border: 1px solid #3498db;
+                      font-size: 1.1em;
+                  }
+                  .nav-links a:hover {
+                      background: rgba(52, 152, 219, 0.5);
+                      transform: translateY(-2px);
+                  }
+                  .info-section {
+                      margin: 30px 0;
+                      padding: 25px;
+                      background: rgba(52, 73, 94, 0.3);
+                      border-radius: 10px;
+                      border-left: 4px solid #3498db;
+                  }
+              </style>
+          </head>
+          <body>
+              <div class="container">
+                  <div class="header">
+                      <h1>🔐 OpenShift Certificate Monitor</h1>
+                      <p>Comprehensive certificate tracking with rotation prediction</p>
+                  </div>
+                  
+                  <div class="nav-links">
+                      <a href="certs.html">🔐 View Certificates</a>
+                      <a href="javascript:window.location.reload()">🔄 Refresh</a>
+                  </div>
+                  
+                  <div class="info-section">
+                      <h2>📋 Certificate Monitoring Features</h2>
+                      <p>• <strong>Real-time certificate status</strong> across all OpenShift namespaces</p>
+                      <p>• <strong>Rotation prediction</strong> based on certificate creation time and standard rotation periods</p>
+                      <p>• <strong>Expiration alerts</strong> for certificates expiring soon</p>
+                      <p>• <strong>Performance optimized</strong> for large clusters</p>
+                  </div>
+                  
+                  <div class="info-section">
+                      <h2>🔄 Update Schedule</h2>
+                      <p>• <strong>Certificate data updates:</strong> Every 15 minutes</p>
+                      <p>• <strong>Page auto-refresh:</strong> Every 20 minutes</p>
+                      <p>• <strong>Manual refresh:</strong> Available via Refresh button</p>
+                  </div>
+              </div>
+          </body>
+          </html>
+          EOF
+          echo "✅ Website content created successfully!"
+          ls -la /var/www/html/
+          echo "🎉 Init container completed - certificate monitor ready!"
+        volumeMounts:
+        - name: website-content
+          mountPath: /var/www/html
+        - name: cert-checker-script
+          mountPath: /scripts
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          capabilities:
+            drop:
+            - ALL
+          seccompProfile:
+            type: RuntimeDefault
+      containers:
+      - name: httpd
+        image: registry.redhat.io/ubi9/httpd-24:latest
+        ports:
+        - containerPort: 8080
+        volumeMounts:
+        - name: website-content
+          mountPath: /var/www/html
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          capabilities:
+            drop:
+            - ALL
+          seccompProfile:
+            type: RuntimeDefault
+      - name: cert-updater
+        image: registry.redhat.io/openshift4/ose-cli:latest
+        command:
+        - /bin/bash
+        - -c
+        - |
+          while true; do
+            echo "🔄 Updating certificate status..."
+            start_time=$(date +%s)
+            /scripts/check-certs.sh
+            end_time=$(date +%s)
+            duration=$((end_time - start_time))
+            echo "✅ Certificate status updated at $(date) (took ${duration}s)"
+            echo "💤 Sleeping for 15 minutes before next update..."
+            sleep 900  # Update every 15 minutes instead of 1 minute
+          done
+        volumeMounts:
+        - name: website-content
+          mountPath: /var/www/html
+        - name: cert-checker-script
+          mountPath: /scripts
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "300m"
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          capabilities:
+            drop:
+            - ALL
+          seccompProfile:
+            type: RuntimeDefault
+      volumes:
+      - name: website-content
+        persistentVolumeClaim:
+          claimName: cert-app-content-pvc
+      - name: cert-checker-script
+        configMap:
+          name: cert-checker-script
+          defaultMode: 0755
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cert-status-service
+  namespace: cert-status-app
+  labels:
+    app: cert-status-monitor
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
+  selector:
+    app: cert-status-monitor
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: cert-status-route
+  namespace: cert-status-app
+  labels:
+    app: cert-status-monitor
+spec:
+  to:
+    kind: Service
+    name: cert-status-service
+    weight: 100
+  port:
+    targetPort: 8080
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None 

@@ -1,0 +1,246 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cert-status-app
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cert-checker-script
+  namespace: cert-status-app
+data:
+  check-certs.sh: |
+    #!/bin/bash
+    set -e
+    
+    # Create basic HTML file
+    cat > /var/www/html/certs.html << 'EOF'
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Certificate Status Monitor</title>
+        <meta http-equiv="refresh" content="30">
+        <style>
+            body { font-family: Arial, sans-serif; margin: 20px; }
+            table { width: 100%; border-collapse: collapse; }
+            th, td { padding: 8px; border: 1px solid #ddd; text-align: left; }
+            th { background-color: #f2f2f2; }
+        </style>
+    </head>
+    <body>
+        <h1>Certificate Status Monitor</h1>
+        <p>Last updated: <span id="timestamp"></span></p>
+        <table>
+            <thead>
+                <tr>
+                    <th>Namespace</th>
+                    <th>Certificate</th>
+                    <th>Created</th>
+                    <th>Expires</th>
+                    <th>Days Left</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody>
+    EOF
+    
+    # Function to check certificates
+    check_certs() {
+        local current_epoch=$(date +%s)
+        
+        # Get all namespaces
+        for namespace in openshift-etcd openshift-kube-apiserver openshift-authentication openshift-image-registry kube-system; do
+            if oc get namespace "$namespace" >/dev/null 2>&1; then
+                # Get secrets in namespace
+                oc -n "$namespace" get secrets --no-headers -o custom-columns="NAME:.metadata.name" 2>/dev/null | while read -r name; do
+                    if [[ -n "$name" ]]; then
+                        # Check if it's a certificate - try multiple key patterns
+                        local cert_data=""
+                        cert_data=$(oc -n "$namespace" get secret "$name" -o go-template='{{index .data "tls.crt"}}' 2>/dev/null)
+                        if [[ -z "$cert_data" ]]; then
+                            # Try to find any .crt key by getting all data and filtering
+                            cert_data=$(oc -n "$namespace" get secret "$name" -o yaml 2>/dev/null | grep -A 1 "\.crt:" | tail -1 | awk '{print $2}')
+                        fi
+                        if [[ -n "$cert_data" ]]; then
+                            local cert_decoded=$(echo "$cert_data" | base64 -d 2>/dev/null)
+                            if [[ -n "$cert_decoded" ]]; then
+                                local not_before=$(echo "$cert_decoded" | openssl x509 -noout -startdate 2>/dev/null | cut -d= -f2)
+                                local not_after=$(echo "$cert_decoded" | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+                                
+                                if [[ -n "$not_before" && -n "$not_after" ]]; then
+                                    local before_epoch=$(date -j -f "%b %d %H:%M:%S %Y %Z" "$not_before" +%s 2>/dev/null)
+                                    local after_epoch=$(date -j -f "%b %d %H:%M:%S %Y %Z" "$not_after" +%s 2>/dev/null)
+                                    
+                                    if [[ -n "$before_epoch" && -n "$after_epoch" ]]; then
+                                        local days_until_expiry=$(( (after_epoch - current_epoch) / 86400 ))
+                                        local created_date=$(date -j -f "%b %d %H:%M:%S %Y %Z" "$not_before" "+%m/%d/%Y" 2>/dev/null || echo "Unknown")
+                                        local expiry_date=$(date -j -f "%b %d %H:%M:%S %Y %Z" "$not_after" "+%m/%d/%Y" 2>/dev/null || echo "Unknown")
+                                        
+                                        local status="OK"
+                                        if [[ "$days_until_expiry" -lt 0 ]]; then
+                                            status="EXPIRED"
+                                        elif [[ "$days_until_expiry" -lt 30 ]]; then
+                                            status="EXPIRING"
+                                        fi
+                                        
+                                        # Write row to temp file
+                                        echo "                <tr>" >> /tmp/cert_rows.html
+                                        echo "                    <td>$namespace</td>" >> /tmp/cert_rows.html
+                                        echo "                    <td>$name</td>" >> /tmp/cert_rows.html
+                                        echo "                    <td>$created_date</td>" >> /tmp/cert_rows.html
+                                        echo "                    <td>$expiry_date</td>" >> /tmp/cert_rows.html
+                                        echo "                    <td>$days_until_expiry</td>" >> /tmp/cert_rows.html
+                                        echo "                    <td>$status</td>" >> /tmp/cert_rows.html
+                                        echo "                </tr>" >> /tmp/cert_rows.html
+                                    fi
+                                fi
+                            fi
+                        fi
+                    fi
+                done
+            fi
+        done
+    }
+    
+    # Clear temp file
+    > /tmp/cert_rows.html
+    
+    # Run certificate check
+    check_certs
+    
+    # Append rows to main HTML file
+    cat /tmp/cert_rows.html >> /var/www/html/certs.html
+    
+    # Close HTML
+    cat >> /var/www/html/certs.html << 'EOF'
+            </tbody>
+        </table>
+        <script>
+            document.getElementById('timestamp').textContent = new Date().toLocaleString();
+        </script>
+    </body>
+    </html>
+    EOF
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cert-status-app
+  namespace: cert-status-app
+  labels:
+    app: cert-status-monitor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cert-status-monitor
+  template:
+    metadata:
+      labels:
+        app: cert-status-monitor
+    spec:
+      serviceAccountName: cert-monitor-sa
+      containers:
+      - name: httpd
+        image: registry.redhat.io/rhel8/httpd-24:latest
+        ports:
+        - containerPort: 8080
+        volumeMounts:
+        - name: html-content
+          mountPath: /var/www/html
+        resources:
+          limits:
+            cpu: 100m
+            memory: 128Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
+      - name: cert-updater
+        image: registry.redhat.io/openshift4/ose-cli:latest
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          set -e
+          cp /scripts/check-certs.sh /tmp/check-certs.sh
+          chmod +x /tmp/check-certs.sh
+          while true; do
+            /tmp/check-certs.sh
+            sleep 300
+          done
+        volumeMounts:
+        - name: cert-checker-script
+          mountPath: /scripts
+        - name: html-content
+          mountPath: /var/www/html
+        resources:
+          limits:
+            cpu: 100m
+            memory: 128Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
+      volumes:
+      - name: html-content
+        emptyDir: {}
+      - name: cert-checker-script
+        configMap:
+          name: cert-checker-script
+          defaultMode: 0755
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cert-monitor-sa
+  namespace: cert-status-app
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cert-monitor-role
+rules:
+- apiGroups: [""]
+  resources: ["secrets", "namespaces"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cert-monitor-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cert-monitor-role
+subjects:
+- kind: ServiceAccount
+  name: cert-monitor-sa
+  namespace: cert-status-app
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cert-status-service
+  namespace: cert-status-app
+  labels:
+    app: cert-status-monitor
+spec:
+  ports:
+  - port: 8080
+    targetPort: 8080
+  selector:
+    app: cert-status-monitor
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: cert-status-route
+  namespace: cert-status-app
+  labels:
+    app: cert-status-monitor
+spec:
+  to:
+    kind: Service
+    name: cert-status-service
+  port:
+    targetPort: 8080

@@ -1,0 +1,57 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hello-world-test
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-world
+  namespace: hello-world-test
+  labels:
+    app: hello-world
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hello-world
+  template:
+    metadata:
+      labels:
+        app: hello-world
+    spec:
+      containers:
+      - name: hello-world
+        image: busybox:1.35
+        ports:
+        - containerPort: 8080
+        command: ["/bin/sh"]
+        args: ["-c", "while true; do echo -e 'HTTP/1.1 200 OK\nContent-Type: text/html\n\n<html><body><h1>Hello World!</h1><p>This is a test application.</p><p>Time: '$(date)'</p></body></html>' | nc -l -p 8080; done"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello-world-service
+  namespace: hello-world-test
+  labels:
+    app: hello-world
+spec:
+  ports:
+  - port: 8080
+    targetPort: 8080
+  selector:
+    app: hello-world
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: hello-world-route
+  namespace: hello-world-test
+  labels:
+    app: hello-world
+spec:
+  to:
+    kind: Service
+    name: hello-world-service
+  port:
+    targetPort: 8080
