@@ -285,6 +285,9 @@ def determine_managed_status(resource_type, name, namespace, cert_data, issuer, 
     issuer_lower = issuer.lower()
     if 'service-ca' in issuer_lower or 'openshift-service-serving-signer' in issuer_lower:
         return "Platform-Managed (Auto-Rotated)", f"Service-CA signed; {validity_days} days validity"
+    # Cluster-Proxy CA pattern: open-cluster-management:cluster-proxy
+    if 'open-cluster-management:cluster-proxy' in issuer_lower or 'cluster-proxy' in issuer_lower:
+        return "Platform-Managed (Auto-Rotated)", f"Cluster-Proxy CA signed; {validity_days} days validity"
     # Platform-CA patterns: etcd, kube-apiserver, kube-controller-manager, openshift, kubernetes, kube-csr-signer, cluster-manager-webhook
     platform_ca_patterns = ['etcd', 'kube-apiserver', 'kube-controller-manager', 'openshift', 'kubernetes', 'kube-csr-signer', 'cluster-manager-webhook']
     if any(pattern in issuer_lower for pattern in platform_ca_patterns):
