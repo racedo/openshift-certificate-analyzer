@@ -44,11 +44,11 @@ func needNewSigningCertKeyPair(secret *corev1.Secret, refresh time.Duration, ref
 ```
 
 **Key Features**:
-- ✅ **Universal 80% rule**: All certificates rotate when 1/5th (20%) of validity remains
-- ✅ **Automatic timing**: Calculates rotation time based on certificate validity
-- ✅ **Certificate generation**: Creates new certificates with proper cryptographic properties
-- ✅ **Annotation management**: Adds TLS metadata annotations automatically
-- ✅ **CA bundle management**: Maintains CA bundles with all valid certificates
+- **Universal 80% rule**: All certificates rotate when 1/5th (20%) of validity remains
+- **Automatic timing**: Calculates rotation time based on certificate validity
+- **Certificate generation**: Creates new certificates with proper cryptographic properties
+- **Annotation management**: Adds TLS metadata annotations automatically
+- **CA bundle management**: Maintains CA bundles with all valid certificates
 
 ### Layer 2: Operators/Components (Integration & Execution)
 
@@ -199,10 +199,10 @@ var ResyncInterval = time.Minute * 10           // 10 minutes
    ```
 
 **What OCM Doesn't Do**:
-- ❌ Implement rotation timing logic (library-go does this)
-- ❌ Calculate 80% threshold (library-go does this)
-- ❌ Generate certificates (library-go does this)
-- ❌ Manage CA bundles (library-go does this)
+- Implement rotation timing logic (library-go does this)
+- Calculate 80% threshold (library-go does this)
+- Generate certificates (library-go does this)
+- Manage CA bundles (library-go does this)
 
 ## FAQ
 
@@ -211,29 +211,29 @@ var ResyncInterval = time.Minute * 10           // 10 minutes
 **A: Partially - they integrate library-go, but don't write rotation logic**
 
 - **Operators/Components are responsible for**:
-  - ✅ Importing library-go certrotation
-  - ✅ Creating rotation controller objects
-  - ✅ Configuring validity periods and resync intervals
-  - ✅ Running controllers in their control loop
-  - ✅ Calling library-go's `EnsureSigningCertKeyPair()` and `EnsureTargetCertKeyPair()`
+  - Importing library-go certrotation
+  - Creating rotation controller objects
+  - Configuring validity periods and resync intervals
+  - Running controllers in their control loop
+  - Calling library-go's `EnsureSigningCertKeyPair()` and `EnsureTargetCertKeyPair()`
 
 - **Operators/Components are NOT responsible for**:
-  - ❌ Implementing the 80% rotation rule (library-go does this)
-  - ❌ Calculating rotation timing (library-go does this)
-  - ❌ Generating certificates (library-go does this)
-  - ❌ Managing CA bundles (library-go does this)
+  - Implementing the 80% rotation rule (library-go does this)
+  - Calculating rotation timing (library-go does this)
+  - Generating certificates (library-go does this)
+  - Managing CA bundles (library-go does this)
 
 ### Q: Is this part of library-go?
 
 **A: Yes - the core rotation logic is entirely in library-go**
 
 The `github.com/openshift/library-go/pkg/operator/certrotation` package provides:
-- ✅ Universal rotation framework
-- ✅ 80% validity threshold logic
-- ✅ Certificate generation
-- ✅ CA bundle management
-- ✅ Annotation management
-- ✅ Timing calculations
+- Universal rotation framework
+- 80% validity threshold logic
+- Certificate generation
+- CA bundle management
+- Annotation management
+- Timing calculations
 
 ### Q: Is there automation within an OpenShift component taking care of it?
 
@@ -265,15 +265,15 @@ The `github.com/openshift/library-go/pkg/operator/certrotation` package provides
 **Important Distinction**:
 
 1. **Actual Rotation** (handled by library-go):
-   - ✅ Rotation happens via library-go's 80% rule logic
-   - ✅ Works automatically when using `RotatedSigningCASecret` or `RotatedSelfSignedCertKeySecret`
-   - ✅ **Does NOT require the annotation** - rotation is independent of metadata
+   - Rotation happens via library-go's 80% rule logic
+   - Works automatically when using `RotatedSigningCASecret` or `RotatedSelfSignedCertKeySecret`
+   - **Does NOT require the annotation** - rotation is independent of metadata
 
 2. **Refresh Period Annotation** (TLS Registry requirement):
-   - 📋 `certificates.openshift.io/refresh-period` is metadata for OpenShift's TLS Registry
-   - 📋 Indicates the operator's **commitment** that rotation is tested and working
-   - 📋 Library-go **automatically adds** this annotation IF the operator passes `refresh` in `AdditionalAnnotations`
-   - 📋 **Missing annotation = TLS Registry violation**, but rotation still works
+   - `certificates.openshift.io/refresh-period` is metadata for OpenShift's TLS Registry
+   - Indicates the operator's **commitment** that rotation is tested and working
+   - Library-go **automatically adds** this annotation IF the operator passes `refresh` in `AdditionalAnnotations`
+   - **Missing annotation = TLS Registry violation**, but rotation still works
 
 **How library-go adds the annotation** (from `signer.go:251` and `target.go:290`):
 ```go
@@ -286,9 +286,9 @@ _ = tlsAnnotations.EnsureTLSMetadataUpdate(&secret.ObjectMeta)  // Adds annotati
 - The `AdditionalAnnotations.RefreshPeriod` field is populated
 
 **Key Point**: You can use library-go to rotate certificates properly, but if you don't configure the `refresh` period in `AdditionalAnnotations`, the annotation won't be added. This means:
-- ✅ **Rotation still works** (library-go's 80% rule handles it)
-- ❌ **TLS Registry requirement not met** (annotation missing)
-- ⚠️ **CI tests may fail** (violation tracking in `tls/violations/refresh-period/`)
+- **Rotation still works** (library-go's 80% rule handles it)
+- **TLS Registry requirement not met** (annotation missing)
+- **CI tests may fail** (violation tracking in `tls/violations/refresh-period/`)
 
 **Best Practice**: Always configure `AdditionalAnnotations.RefreshPeriod` when using library-go to meet TLS Registry requirements, even though rotation works without it.
 
@@ -298,22 +298,22 @@ _ = tlsAnnotations.EnsureTLSMetadataUpdate(&secret.ObjectMeta)  // Adds annotati
 
 The annotation serves as a **certification** that the operator team has verified rotation works. According to the requirement definition, adding the annotation means you have:
 
-1. ✅ **Manually tested** that rotation works, OR seen someone else test it, **AND**
-2. ✅ **Written an automated e2e test** that is blocking GA criteria, **AND/OR** QE has required a test every release, **AND**
-3. ✅ **Linked to a test name annotation** (`certificates.openshift.io/test-name`) that identifies the verifying test
+1. **Manually tested** that rotation works, OR seen someone else test it, **AND**
+2. **Written an automated e2e test** that is blocking GA criteria, **AND/OR** QE has required a test every release, **AND**
+3. **Linked to a test name annotation** (`certificates.openshift.io/test-name`) that identifies the verifying test
 
 **Purpose of the Annotation**:
 
-- 📋 **Trust-based tracking**: Identifies which certificates have been verified to rotate properly
-- 📋 **Operator commitment**: The operator team is asserting "we've tested this and it works"
-- 📋 **Visibility**: Provides a registry of "certified" auto-rotating certificates
-- 📋 **Compliance tracking**: Enables violation detection for untested certificates
-- 📋 **CI enforcement**: PRs adding certificates without annotations fail CI (violation regression test)
+- **Trust-based tracking**: Identifies which certificates have been verified to rotate properly
+- **Operator commitment**: The operator team is asserting "we've tested this and it works"
+- **Visibility**: Provides a registry of "certified" auto-rotating certificates
+- **Compliance tracking**: Enables violation detection for untested certificates
+- **CI enforcement**: PRs adding certificates without annotations fail CI (violation regression test)
 
 **Important**: The annotation is **not automatically verified** - it's a **promise** by the operator team. However:
-- ✅ Ideally backed by e2e tests (blocking GA or QE-required)
-- ✅ Should have a linked `test-name` annotation
-- ✅ CI will fail if violations increase (prevents regressions)
+- Ideally backed by e2e tests (blocking GA or QE-required)
+- Should have a linked `test-name` annotation
+- CI will fail if violations increase (prevents regressions)
 
 **Current Status**: Only 41 out of 275+ certificates have the annotation, indicating this is a newer requirement that operators are gradually adopting.
 
@@ -324,18 +324,18 @@ The annotation serves as a **certification** that the operator team has verified
 **A: No - they serve different purposes: ownership is for accountability, refresh period is for verification**
 
 **Ownership Annotation** (`openshift.io/owning-component`):
-- 🎯 **Purpose**: Identifies which Jira component/team is responsible for the certificate
-- 📋 **Used for**: Routing bugs/issues to the correct team for support
-- 📋 **Example values**: `"Networking / cluster-network-operator"`, `"service-ca"`, `"Etcd"`, `"Machine Config Operator"`
-- 📋 **From TLS README**: "so that issues related to this TLS artifact would be routed to a proper location"
-- 📋 **Automatically added by library-go**: Yes, when using `RotatedSigningCASecret` or `RotatedSelfSignedCertKeySecret` with `AdditionalAnnotations.JiraComponent`
+- **Purpose**: Identifies which Jira component/team is responsible for the certificate
+- **Used for**: Routing bugs/issues to the correct team for support
+- **Example values**: `"Networking / cluster-network-operator"`, `"service-ca"`, `"Etcd"`, `"Machine Config Operator"`
+- **From TLS README**: "so that issues related to this TLS artifact would be routed to a proper location"
+- **Automatically added by library-go**: Yes, when using `RotatedSigningCASecret` or `RotatedSelfSignedCertKeySecret` with `AdditionalAnnotations.JiraComponent`
 
 **Refresh Period Annotation** (`certificates.openshift.io/refresh-period`):
-- 🎯 **Purpose**: Indicates that certificate rotation has been tested and verified
-- 📋 **Used for**: Tracking which certificates are "certified" to auto-rotate
-- 📋 **Example values**: `"2y"`, `"15d"`, `"1y"`
-- 📋 **Requirement**: Must have manual testing + e2e test + test name annotation
-- 📋 **Automatically added by library-go**: Yes, IF `AdditionalAnnotations.RefreshPeriod` is configured
+- **Purpose**: Indicates that certificate rotation has been tested and verified
+- **Used for**: Tracking which certificates are "certified" to auto-rotate
+- **Example values**: `"2y"`, `"15d"`, `"1y"`
+- **Requirement**: Must have manual testing + e2e test + test name annotation
+- **Automatically added by library-go**: Yes, IF `AdditionalAnnotations.RefreshPeriod` is configured
 
 **Key Differences**:
 
@@ -344,7 +344,7 @@ The annotation serves as a **certification** that the operator team has verified
 | **Purpose** | Accountability & issue routing | Verification & testing commitment |
 | **Question it answers** | "Who owns this certificate?" | "Is rotation tested and verified?" |
 | **Used by** | Support teams, bug tracking | Compliance tracking, TLS Registry |
-| **Requires testing** | ❌ No | ✅ Yes (manual + e2e test) |
+| **Requires testing** | No | Yes (manual + e2e test) |
 | **Violation tracking** | Yes (`ownership-violations.json`) | Yes (`refresh-period-violations.json`) |
 
 **Both are metadata requirements** for the TLS Registry, but they track different aspects:
