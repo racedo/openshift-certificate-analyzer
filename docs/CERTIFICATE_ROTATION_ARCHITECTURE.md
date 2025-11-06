@@ -1,6 +1,6 @@
-# Certificate Rotation Architecture: Who is Responsible?
+# Certificate Rotation Architecture
 
-## Executive Summary
+## TL;DR
 
 **Certificate rotation in OpenShift is a shared responsibility between library-go and operators/components:**
 
@@ -204,7 +204,7 @@ var ResyncInterval = time.Minute * 10           // 10 minutes
 - ❌ Generate certificates (library-go does this)
 - ❌ Manage CA bundles (library-go does this)
 
-## Answer to Your Question
+## FAQ
 
 ### Q: Is the owner of the operator or component responsible for creating the rotation routine?
 
