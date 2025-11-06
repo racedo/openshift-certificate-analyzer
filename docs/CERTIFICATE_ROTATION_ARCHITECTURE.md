@@ -319,6 +319,40 @@ The annotation serves as a **certification** that the operator team has verified
 
 **Bottom Line**: The annotation exists to track which certificates have been **verified and tested** to rotate, creating a registry of "certified" auto-rotating certificates. It's a commitment system, not proof of CI, though it should ideally be backed by tests.
 
+### Q: Does the ownership annotation serve the same purpose as the refresh period annotation?
+
+**A: No - they serve different purposes: ownership is for accountability, refresh period is for verification**
+
+**Ownership Annotation** (`openshift.io/owning-component`):
+- 🎯 **Purpose**: Identifies which Jira component/team is responsible for the certificate
+- 📋 **Used for**: Routing bugs/issues to the correct team for support
+- 📋 **Example values**: `"Networking / cluster-network-operator"`, `"service-ca"`, `"Etcd"`, `"Machine Config Operator"`
+- 📋 **From TLS README**: "so that issues related to this TLS artifact would be routed to a proper location"
+- 📋 **Automatically added by library-go**: Yes, when using `RotatedSigningCASecret` or `RotatedSelfSignedCertKeySecret` with `AdditionalAnnotations.JiraComponent`
+
+**Refresh Period Annotation** (`certificates.openshift.io/refresh-period`):
+- 🎯 **Purpose**: Indicates that certificate rotation has been tested and verified
+- 📋 **Used for**: Tracking which certificates are "certified" to auto-rotate
+- 📋 **Example values**: `"2y"`, `"15d"`, `"1y"`
+- 📋 **Requirement**: Must have manual testing + e2e test + test name annotation
+- 📋 **Automatically added by library-go**: Yes, IF `AdditionalAnnotations.RefreshPeriod` is configured
+
+**Key Differences**:
+
+| Aspect | Ownership Annotation | Refresh Period Annotation |
+|--------|---------------------|---------------------------|
+| **Purpose** | Accountability & issue routing | Verification & testing commitment |
+| **Question it answers** | "Who owns this certificate?" | "Is rotation tested and verified?" |
+| **Used by** | Support teams, bug tracking | Compliance tracking, TLS Registry |
+| **Requires testing** | ❌ No | ✅ Yes (manual + e2e test) |
+| **Violation tracking** | Yes (`ownership-violations.json`) | Yes (`refresh-period-violations.json`) |
+
+**Both are metadata requirements** for the TLS Registry, but they track different aspects:
+- **Ownership** = "Who is responsible?" (for support/bug routing)
+- **Refresh Period** = "Is it verified to rotate?" (for compliance/testing)
+
+**Both can be added automatically by library-go** when operators configure `AdditionalAnnotations` properly.
+
 ## Key Takeaways
 
 1. **library-go provides the rotation logic** - operators don't implement it themselves
