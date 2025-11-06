@@ -292,6 +292,33 @@ _ = tlsAnnotations.EnsureTLSMetadataUpdate(&secret.ObjectMeta)  // Adds annotati
 
 **Best Practice**: Always configure `AdditionalAnnotations.RefreshPeriod` when using library-go to meet TLS Registry requirements, even though rotation works without it.
 
+### Q: Why does the refresh period annotation exist if rotation works without it?
+
+**A: It's a commitment/assertion system for tracking verified rotation, not proof of CI**
+
+The annotation serves as a **certification** that the operator team has verified rotation works. According to the requirement definition, adding the annotation means you have:
+
+1. ✅ **Manually tested** that rotation works, OR seen someone else test it, **AND**
+2. ✅ **Written an automated e2e test** that is blocking GA criteria, **AND/OR** QE has required a test every release, **AND**
+3. ✅ **Linked to a test name annotation** (`certificates.openshift.io/test-name`) that identifies the verifying test
+
+**Purpose of the Annotation**:
+
+- 📋 **Trust-based tracking**: Identifies which certificates have been verified to rotate properly
+- 📋 **Operator commitment**: The operator team is asserting "we've tested this and it works"
+- 📋 **Visibility**: Provides a registry of "certified" auto-rotating certificates
+- 📋 **Compliance tracking**: Enables violation detection for untested certificates
+- 📋 **CI enforcement**: PRs adding certificates without annotations fail CI (violation regression test)
+
+**Important**: The annotation is **not automatically verified** - it's a **promise** by the operator team. However:
+- ✅ Ideally backed by e2e tests (blocking GA or QE-required)
+- ✅ Should have a linked `test-name` annotation
+- ✅ CI will fail if violations increase (prevents regressions)
+
+**Current Status**: Only 41 out of 275+ certificates have the annotation, indicating this is a newer requirement that operators are gradually adopting.
+
+**Bottom Line**: The annotation exists to track which certificates have been **verified and tested** to rotate, creating a registry of "certified" auto-rotating certificates. It's a commitment system, not proof of CI, though it should ideally be backed by tests.
+
 ## Key Takeaways
 
 1. **library-go provides the rotation logic** - operators don't implement it themselves
