@@ -10,7 +10,10 @@ import base64
 import subprocess
 import json
 import re
+import time
+import logging
 from datetime import datetime, timezone
+from threading import Thread, Lock
 from flask import Flask, render_template_string, jsonify
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
@@ -18,16 +21,108 @@ from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
 
 # Try to load in-cluster config, fallback to kubeconfig
 try:
     config.load_incluster_config()
+    logger.info("Loaded in-cluster Kubernetes config")
 except:
     try:
         config.load_kube_config()
+        logger.info("Loaded kubeconfig from file")
     except:
+        logger.warning("Failed to load Kubernetes config")
         pass
+
+# Certificate cache with thread-safe access
+class CertificateCache:
+    """Thread-safe cache for certificate data with background refresh."""
+
+    def __init__(self, refresh_interval=300):
+        self.data = None
+        self.cluster_name = 'unknown-cluster'
+        self.last_update = None
+        self.lock = Lock()
+        self.refresh_interval = refresh_interval
+        self.refresh_thread = None
+        logger.info(f"Initialized CertificateCache with {refresh_interval}s refresh interval")
+
+    def start_background_refresh(self):
+        """Start background thread to refresh certificate data."""
+        def refresh_loop():
+            while True:
+                try:
+                    logger.info("Starting certificate discovery...")
+                    start_time = time.time()
+                    certificates = discover_certificates()
+                    cluster_name = self._get_cluster_name()
+
+                    with self.lock:
+                        self.data = certificates
+                        self.cluster_name = cluster_name
+                        self.last_update = datetime.now(timezone.utc)
+
+                    elapsed = time.time() - start_time
+                    logger.info(f"Certificate discovery completed: {len(certificates)} certificates found in {elapsed:.2f}s")
+                except Exception as e:
+                    logger.error(f"Error in background refresh: {e}", exc_info=True)
+
+                time.sleep(self.refresh_interval)
+
+        self.refresh_thread = Thread(target=refresh_loop, daemon=True)
+        self.refresh_thread.start()
+        logger.info("Background refresh thread started")
+
+    def _get_cluster_name(self):
+        """Get cluster name from infrastructure object."""
+        try:
+            custom_api = client.CustomObjectsApi()
+            infra = custom_api.get_cluster_custom_object('config.openshift.io', 'v1', 'infrastructures', 'cluster')
+            return infra.get('status', {}).get('infrastructureName', 'unknown-cluster')
+        except Exception as e:
+            logger.warning(f"Error getting cluster info: {e}")
+            return 'unknown-cluster'
+
+    def get_data(self):
+        """Get cached certificate data. Triggers immediate refresh if no data available."""
+        with self.lock:
+            if self.data is None:
+                logger.info("Cache empty, triggering immediate refresh")
+                # Release lock during discovery to avoid blocking
+                pass
+
+        # If cache is empty, do an immediate refresh (outside lock)
+        if self.data is None:
+            try:
+                logger.info("Performing initial certificate discovery...")
+                start_time = time.time()
+                certificates = discover_certificates()
+                cluster_name = self._get_cluster_name()
+
+                with self.lock:
+                    self.data = certificates
+                    self.cluster_name = cluster_name
+                    self.last_update = datetime.now(timezone.utc)
+
+                elapsed = time.time() - start_time
+                logger.info(f"Initial discovery completed: {len(certificates)} certificates in {elapsed:.2f}s")
+            except Exception as e:
+                logger.error(f"Error during initial refresh: {e}", exc_info=True)
+                return [], 'unknown-cluster', None
+
+        with self.lock:
+            return self.data, self.cluster_name, self.last_update
+
+# Global cache instance (will be started after functions are defined)
+cert_cache = CertificateCache(refresh_interval=300)  # 5 minutes
 
 def get_cert_fingerprint(cert_data):
     """Extract SHA256 fingerprint from certificate data."""
@@ -56,7 +151,7 @@ def get_cert_fingerprint(cert_data):
         fingerprint = cert.fingerprint(hashes.SHA256()).hex().upper()
         return fingerprint
     except Exception as e:
-        print(f"Error getting fingerprint: {e}")
+        logger.debug(f"Error getting fingerprint: {e}")
         # Fallback to openssl if available
         try:
             result = subprocess.run(
@@ -100,7 +195,7 @@ def get_cert_issuer(cert_data):
         issuer = cert.issuer.rfc4514_string()
         return issuer
     except Exception as e:
-        print(f"Error getting issuer: {e}")
+        logger.debug(f"Error getting issuer: {e}")
         # Fallback to openssl if available
         try:
             result = subprocess.run(
@@ -146,7 +241,7 @@ def get_cert_validity_days(cert_data):
         delta = not_after - not_before
         return delta.days
     except Exception as e:
-        print(f"Error getting validity: {e}")
+        logger.debug(f"Error getting validity: {e}")
     return 0
 
 def get_cert_expiry(cert_data):
@@ -176,7 +271,7 @@ def get_cert_expiry(cert_data):
         expiry = cert.not_valid_after.strftime('%b %d %H:%M:%S %Y %Z')
         return expiry
     except Exception as e:
-        print(f"Error getting expiry: {e}")
+        logger.debug(f"Error getting expiry: {e}")
     return ""
 
 def determine_ca_category(issuer, annotations):
@@ -414,10 +509,10 @@ def process_resource(v1, resource_type, name, namespace):
         }
     except ApiException as e:
         if e.status != 404:
-            print(f"Error processing {resource_type} {namespace}/{name}: {e}")
+            logger.warning(f"Error processing {resource_type} {namespace}/{name}: {e}")
         return None
     except Exception as e:
-        print(f"Error processing {resource_type} {namespace}/{name}: {e}")
+        logger.warning(f"Error processing {resource_type} {namespace}/{name}: {e}")
         return None
 
 def discover_certificates():
@@ -436,7 +531,7 @@ def discover_certificates():
                 if cert_info:
                     certificates.append(cert_info)
     except Exception as e:
-        print(f"Error listing secrets: {e}")
+        logger.error(f"Error listing secrets: {e}")
     
     # Get all configmaps
     try:
@@ -449,7 +544,7 @@ def discover_certificates():
                 if cert_info:
                     certificates.append(cert_info)
     except Exception as e:
-        print(f"Error listing configmaps: {e}")
+        logger.error(f"Error listing configmaps: {e}")
     
     return certificates
 
@@ -457,29 +552,25 @@ def discover_certificates():
 def index():
     """Main page displaying certificate discovery results."""
     try:
-        certificates = discover_certificates()
-        
-        # Get cluster info
-        try:
-            custom_api = client.CustomObjectsApi()
-            infra = custom_api.get_cluster_custom_object('config.openshift.io', 'v1', 'infrastructures', 'cluster')
-            cluster_name = infra.get('status', {}).get('infrastructureName', 'unknown-cluster')
-        except Exception as e:
-            print(f"Error getting cluster info: {e}")
-            cluster_name = 'unknown-cluster'
-        
-        generated_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-        
+        # Get cached certificate data
+        certificates, cluster_name, last_update = cert_cache.get_data()
+
+        # Use last update time or current time
+        if last_update:
+            generated_time = last_update.strftime('%Y-%m-%d %H:%M:%S UTC')
+        else:
+            generated_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+
         # Statistics
         total = len(certificates)
         platform_managed = len([c for c in certificates if c and 'Platform-Managed' in c.get('managed_status', '')])
         user_managed = len([c for c in certificates if c and 'User-Managed' in c.get('managed_status', '')])
         auto_rotated = len([c for c in certificates if c and 'Auto-Rotated' in c.get('managed_status', '')])
-        
+
         # Filter out None values
         certificates = [c for c in certificates if c is not None]
-        
-        return render_template_string(HTML_TEMPLATE, 
+
+        return render_template_string(HTML_TEMPLATE,
             certificates=certificates,
             cluster_name=cluster_name,
             generated_time=generated_time,
@@ -491,21 +582,35 @@ def index():
     except Exception as e:
         import traceback
         error_msg = f"Error: {str(e)}\n{traceback.format_exc()}"
-        print(error_msg)
+        logger.error(f"Error in index route: {error_msg}")
         return f"<html><body><h1>Error</h1><pre>{error_msg}</pre></body></html>", 500
 
 @app.route('/health')
 def health():
-    """Simple health check endpoint for readiness probe."""
-    return "OK", 200
+    """Health check endpoint that verifies Kubernetes API connectivity."""
+    try:
+        # Verify we can connect to Kubernetes API
+        v1 = client.CoreV1Api()
+        v1.list_namespace(limit=1)
+        return "OK", 200
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return f"FAILED: {str(e)}", 503
 
 @app.route('/api/certificates')
 def api_certificates():
     """API endpoint returning JSON data."""
     try:
-        certificates = discover_certificates()
-        return jsonify(certificates)
+        # Get cached certificate data
+        certificates, cluster_name, last_update = cert_cache.get_data()
+        return jsonify({
+            'certificates': certificates,
+            'cluster_name': cluster_name,
+            'last_update': last_update.isoformat() if last_update else None,
+            'total': len(certificates)
+        })
     except Exception as e:
+        logger.error(f"Error in API endpoint: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 # HTML Template with same color scheme
@@ -750,6 +855,9 @@ HTML_TEMPLATE = '''
 </body>
     </html>
 '''
+
+# Start background refresh thread after all functions are defined
+cert_cache.start_background_refresh()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080, debug=False)
