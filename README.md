@@ -117,23 +117,52 @@ cd Container
 
 # Apply the deployment manifest
 oc apply -f deploy.yaml
+
+# Update the ConfigMap with the latest application code
+oc create configmap cert-discovery-app-code \
+  --from-file=app.py=app.py \
+  -n cert-discovery-app \
+  --dry-run=client -o yaml | oc apply -f -
+
+# Restart the deployment to pick up the updated code
+oc rollout restart deployment/cert-discovery-app -n cert-discovery-app
 ```
 
 This creates:
 - Namespace: `cert-discovery-app`
+- PersistentVolumeClaim: `cert-discovery-data` (10Gi, for historical data storage)
 - ServiceAccount: `cert-discovery-sa`
 - ClusterRole: `cert-discovery-role` (with permissions to list secrets/configmaps)
 - ClusterRoleBinding: `cert-discovery-binding`
 - Deployment: `cert-discovery-app` (Python Flask application)
+- ConfigMap: `cert-discovery-app-code` (application code)
 - Service: `cert-discovery-service`
 - Route: `cert-discovery-route` (OpenShift Route for external access)
 
-#### Step 3: Wait for Deployment
+#### Step 3: Verify Deployment
 
 Wait for the pod to be ready (this may take 1-2 minutes as it installs Python dependencies):
 
 ```bash
 oc wait --for=condition=ready pod -l app=cert-discovery -n cert-discovery-app --timeout=300s
+```
+
+Verify the PersistentVolumeClaim is bound:
+
+```bash
+oc get pvc -n cert-discovery-app
+```
+
+Check that the database initialized successfully:
+
+```bash
+oc logs -n cert-discovery-app -l app=cert-discovery --tail=50 | grep -i database
+```
+
+You should see:
+```
+Database initialized successfully at /data/certificates.db
+Database initialized and available for historical tracking
 ```
 
 #### Step 4: Get the Application URL
@@ -170,17 +199,52 @@ These permissions are bound to the `cert-discovery-sa` ServiceAccount via a Clus
 - Flask web server (port 8080)
 - Kubernetes Python client (uses in-cluster service account configuration)
 - Certificate parsing using cryptography library
-- Application code stored in ConfigMap (no persistent storage required)
+- Application code stored in ConfigMap
+- **SQLite database** on PersistentVolume for historical certificate tracking
+- **Background refresh thread** (5-minute interval) with automatic database saves
 
 **Resource Requirements:**
 - CPU: 200m request, 1000m limit
 - Memory: 512Mi request, 2Gi limit
+- Storage: 10Gi PVC (lvms-vg1 storage class)
+
+### Features
+
+**Real-time Certificate Discovery:**
+- Scans all namespaces for certificates in secrets and configmaps
+- Analyzes certificate properties (issuer, expiry, fingerprint)
+- Classifies certificates as platform-managed vs user-managed
+- Updates automatically every 5 minutes via background thread
+
+**Historical Tracking:**
+- Stores discovery results in SQLite database on persistent volume
+- Tracks certificate changes over time (additions, removals, rotations)
+- Provides audit trail for compliance requirements
+- Survives pod restarts and maintains full history
 
 ### API Endpoints
 
+**Current Data:**
 - `/` - Main web interface displaying all certificates in a table format
 - `/health` - Health check endpoint (returns "OK" - used by readiness probe)
-- `/api/certificates` - JSON API returning certificate data as JSON array
+- `/api/certificates` - JSON API returning current certificate data
+
+**Historical Data:**
+- `/api/history` - List all certificate discovery runs (last 100)
+- `/api/history/<id>` - Get specific discovery run details
+- `/api/changes` - Compare last two discovery runs (shows added/removed/changed certificates)
+
+**Example:**
+```bash
+# Get current certificates
+curl -k https://<route-url>/api/certificates | jq '.total'
+
+# View discovery history
+curl -k https://<route-url>/api/history | jq '.[0]'
+
+# See what changed between last two scans
+curl -k https://<route-url>/api/changes | jq
+```
 
 ### Troubleshooting
 
@@ -237,6 +301,60 @@ Test the service directly (from within the cluster):
 oc run test-pod --image=curlimages/curl --rm -it --restart=Never -- curl http://cert-discovery-service.cert-discovery-app.svc.cluster.local/
 ```
 
+### Database and Historical Data
+
+The application stores historical certificate discovery data in a SQLite database (`/data/certificates.db`) on a PersistentVolume. This enables:
+
+**Certificate Change Tracking:**
+- Compare certificates between discovery runs
+- Identify certificate rotations (fingerprint changes)
+- Track certificate additions and removals
+
+**Query Historical Data:**
+```bash
+# Count total discovery runs
+oc exec -n cert-discovery-app deployment/cert-discovery-app -- \
+  sqlite3 /data/certificates.db "SELECT COUNT(*) FROM certificate_discoveries;"
+
+# View recent discoveries
+oc exec -n cert-discovery-app deployment/cert-discovery-app -- \
+  sqlite3 /data/certificates.db \
+  "SELECT id, timestamp, total_certificates FROM certificate_discoveries ORDER BY timestamp DESC LIMIT 5;"
+
+# Check database integrity
+oc exec -n cert-discovery-app deployment/cert-discovery-app -- \
+  sqlite3 /data/certificates.db "PRAGMA integrity_check;"
+```
+
+**Storage Estimates:**
+- ~1 KB per certificate record
+- ~667 certificates per discovery run (typical cluster)
+- 1 discovery every 5 minutes = 288 runs/day
+- Daily storage: ~192 MB
+- 30-day retention: ~5.8 GB
+
+The 10Gi PVC provides ample space for several months of historical data.
+
+### Updating the Application Code
+
+If you modify `app.py`, update the running deployment:
+
+```bash
+cd Container
+
+# Update ConfigMap with new code
+oc create configmap cert-discovery-app-code \
+  --from-file=app.py=app.py \
+  -n cert-discovery-app \
+  --dry-run=client -o yaml | oc apply -f -
+
+# Restart deployment to pick up changes
+oc rollout restart deployment/cert-discovery-app -n cert-discovery-app
+
+# Wait for new pod to be ready
+oc wait --for=condition=ready pod -l app=cert-discovery -n cert-discovery-app --timeout=300s
+```
+
 ### Uninstallation
 
 To completely remove the application:
@@ -248,11 +366,20 @@ oc delete -f deploy.yaml
 
 This will remove:
 - The deployment, service, and route
+- The PersistentVolumeClaim and all historical data
 - The namespace `cert-discovery-app` and all resources within it
 - The ClusterRole `cert-discovery-role`
 - The ClusterRoleBinding `cert-discovery-binding`
 
 **Note:** Removing ClusterRole and ClusterRoleBinding requires cluster-admin privileges.
+
+**Warning:** Deleting the namespace will permanently delete the PersistentVolumeClaim and all historical certificate data. If you need to preserve the data, back up the database first:
+
+```bash
+# Backup database before deletion
+oc exec -n cert-discovery-app deployment/cert-discovery-app -- \
+  cat /data/certificates.db > certificates-backup.db
+```
 
 ## Documentation
 

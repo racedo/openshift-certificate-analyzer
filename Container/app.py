@@ -12,6 +12,7 @@ import json
 import re
 import time
 import logging
+import sqlite3
 from datetime import datetime, timezone
 from threading import Thread, Lock
 from flask import Flask, render_template_string, jsonify
@@ -29,6 +30,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+# Database path (on persistent volume)
+DB_PATH = '/data/certificates.db'
 
 # Try to load in-cluster config, fallback to kubeconfig
 try:
@@ -72,6 +76,9 @@ class CertificateCache:
 
                     elapsed = time.time() - start_time
                     logger.info(f"Certificate discovery completed: {len(certificates)} certificates found in {elapsed:.2f}s")
+
+                    # Save to database if available
+                    save_discovery_to_db(certificates, cluster_name, elapsed)
                 except Exception as e:
                     logger.error(f"Error in background refresh: {e}", exc_info=True)
 
@@ -114,6 +121,9 @@ class CertificateCache:
 
                 elapsed = time.time() - start_time
                 logger.info(f"Initial discovery completed: {len(certificates)} certificates in {elapsed:.2f}s")
+
+                # Save to database if available
+                save_discovery_to_db(certificates, cluster_name, elapsed)
             except Exception as e:
                 logger.error(f"Error during initial refresh: {e}", exc_info=True)
                 return [], 'unknown-cluster', None
@@ -123,6 +133,118 @@ class CertificateCache:
 
 # Global cache instance (will be started after functions are defined)
 cert_cache = CertificateCache(refresh_interval=300)  # 5 minutes
+
+def init_database():
+    """Initialize SQLite database with certificate tracking tables."""
+    try:
+        # Check if /data directory exists (PV mounted)
+        data_dir = os.path.dirname(DB_PATH)
+        if not os.path.exists(data_dir):
+            logger.warning(f"Data directory {data_dir} does not exist - PV may not be mounted. Database will not be available.")
+            return False
+
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        # Create certificate_discoveries table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS certificate_discoveries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                cluster_name TEXT,
+                total_certificates INTEGER,
+                platform_managed INTEGER,
+                user_managed INTEGER,
+                auto_rotated INTEGER,
+                discovery_duration_seconds REAL
+            )
+        ''')
+
+        # Create certificates table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS certificates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                discovery_id INTEGER,
+                namespace TEXT,
+                name TEXT,
+                resource_type TEXT,
+                fingerprint TEXT,
+                issuer TEXT,
+                expiry TEXT,
+                validity_years INTEGER,
+                managed_status TEXT,
+                ca_category TEXT,
+                FOREIGN KEY (discovery_id) REFERENCES certificate_discoveries(id)
+            )
+        ''')
+
+        # Create indexes for fast queries
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_fingerprint ON certificates(fingerprint)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_discovery_id ON certificates(discovery_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_expiry ON certificates(expiry)')
+
+        conn.commit()
+        conn.close()
+
+        logger.info(f"Database initialized successfully at {DB_PATH}")
+        return True
+    except Exception as e:
+        logger.error(f"Error initializing database: {e}", exc_info=True)
+        return False
+
+def save_discovery_to_db(certificates, cluster_name, duration):
+    """Save discovery results to database."""
+    try:
+        # Check if database is available
+        if not os.path.exists(DB_PATH):
+            logger.debug("Database not available, skipping save")
+            return None
+
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        # Calculate statistics
+        total = len(certificates)
+        platform_managed = len([c for c in certificates if 'Platform-Managed' in c.get('managed_status', '')])
+        user_managed = len([c for c in certificates if 'User-Managed' in c.get('managed_status', '')])
+        auto_rotated = len([c for c in certificates if 'Auto-Rotated' in c.get('managed_status', '')])
+
+        # Insert discovery run
+        cursor.execute('''
+            INSERT INTO certificate_discoveries
+            (cluster_name, total_certificates, platform_managed, user_managed, auto_rotated, discovery_duration_seconds)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (cluster_name, total, platform_managed, user_managed, auto_rotated, duration))
+
+        discovery_id = cursor.lastrowid
+
+        # Insert certificates
+        for cert in certificates:
+            cursor.execute('''
+                INSERT INTO certificates
+                (discovery_id, namespace, name, resource_type, fingerprint, issuer, expiry, validity_years, managed_status, ca_category)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                discovery_id,
+                cert.get('namespace'),
+                cert.get('name'),
+                cert.get('resource_type'),
+                cert.get('fingerprint'),
+                cert.get('issuer'),
+                cert.get('expiry'),
+                cert.get('validity_years'),
+                cert.get('managed_status'),
+                cert.get('ca_category')
+            ))
+
+        conn.commit()
+        conn.close()
+
+        logger.info(f"Saved discovery #{discovery_id} to database: {total} certificates")
+        return discovery_id
+    except Exception as e:
+        logger.error(f"Error saving discovery to database: {e}", exc_info=True)
+        return None
 
 def get_cert_fingerprint(cert_data):
     """Extract SHA256 fingerprint from certificate data."""
@@ -613,6 +735,136 @@ def api_certificates():
         logger.error(f"Error in API endpoint: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/history')
+def api_history():
+    """Get list of all discovery runs from database."""
+    try:
+        if not os.path.exists(DB_PATH):
+            return jsonify({'error': 'Database not available - PV may not be mounted'}), 503
+
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT * FROM certificate_discoveries
+            ORDER BY timestamp DESC
+            LIMIT 100
+        ''')
+
+        discoveries = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+
+        return jsonify(discoveries)
+    except Exception as e:
+        logger.error(f"Error in history endpoint: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/history/<int:discovery_id>')
+def api_history_detail(discovery_id):
+    """Get certificates from a specific discovery run."""
+    try:
+        if not os.path.exists(DB_PATH):
+            return jsonify({'error': 'Database not available - PV may not be mounted'}), 503
+
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Get discovery metadata
+        cursor.execute('''
+            SELECT * FROM certificate_discoveries
+            WHERE id = ?
+        ''', (discovery_id,))
+
+        discovery = cursor.fetchone()
+        if not discovery:
+            conn.close()
+            return jsonify({'error': 'Discovery not found'}), 404
+
+        # Get certificates
+        cursor.execute('''
+            SELECT * FROM certificates
+            WHERE discovery_id = ?
+        ''', (discovery_id,))
+
+        certificates = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+
+        return jsonify({
+            'discovery': dict(discovery),
+            'certificates': certificates
+        })
+    except Exception as e:
+        logger.error(f"Error in history detail endpoint: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/changes')
+def api_changes():
+    """Show changes between last two discovery runs."""
+    try:
+        if not os.path.exists(DB_PATH):
+            return jsonify({'error': 'Database not available - PV may not be mounted'}), 503
+
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Get last two discoveries
+        cursor.execute('''
+            SELECT id, timestamp FROM certificate_discoveries
+            ORDER BY timestamp DESC
+            LIMIT 2
+        ''')
+
+        discoveries = [dict(row) for row in cursor.fetchall()]
+
+        if len(discoveries) < 2:
+            conn.close()
+            return jsonify({'message': 'Need at least 2 discovery runs to compare'})
+
+        older_id = discoveries[1]['id']
+        newer_id = discoveries[0]['id']
+
+        # Get older certificates
+        cursor.execute('''
+            SELECT namespace, name, fingerprint FROM certificates
+            WHERE discovery_id = ?
+        ''', (older_id,))
+        old_certs = {(row['namespace'], row['name']): row['fingerprint'] for row in cursor.fetchall()}
+
+        # Get newer certificates
+        cursor.execute('''
+            SELECT namespace, name, fingerprint FROM certificates
+            WHERE discovery_id = ?
+        ''', (newer_id,))
+        new_certs = {(row['namespace'], row['name']): row['fingerprint'] for row in cursor.fetchall()}
+
+        conn.close()
+
+        # Detect changes
+        added = [k for k in new_certs if k not in old_certs]
+        removed = [k for k in old_certs if k not in new_certs]
+        changed = [k for k in new_certs if k in old_certs and new_certs[k] != old_certs[k]]
+
+        return jsonify({
+            'older_discovery': discoveries[1],
+            'newer_discovery': discoveries[0],
+            'summary': {
+                'added': len(added),
+                'removed': len(removed),
+                'changed': len(changed)
+            },
+            'details': {
+                'added': [{'namespace': k[0], 'name': k[1]} for k in added],
+                'removed': [{'namespace': k[0], 'name': k[1]} for k in removed],
+                'changed': [{'namespace': k[0], 'name': k[1]} for k in changed]
+            }
+        })
+    except Exception as e:
+        logger.error(f"Error in changes endpoint: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
 # HTML Template with same color scheme
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
@@ -855,6 +1107,13 @@ HTML_TEMPLATE = '''
 </body>
     </html>
 '''
+
+# Initialize database on startup (if PV is mounted)
+db_available = init_database()
+if db_available:
+    logger.info("Database initialized and available for historical tracking")
+else:
+    logger.warning("Database not available - running without persistent storage")
 
 # Start background refresh thread after all functions are defined
 cert_cache.start_background_refresh()

@@ -7,6 +7,19 @@ metadata:
     app: cert-discovery
 ---
 apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cert-discovery-data
+  namespace: cert-discovery-app
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: lvms-vg1
+---
+apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: cert-discovery-sa
@@ -70,6 +83,8 @@ spec:
         volumeMounts:
         - name: app-code
           mountPath: /app
+        - name: data-volume
+          mountPath: /data
         resources:
           requests:
             cpu: 200m
@@ -103,6 +118,9 @@ spec:
       - name: app-code
         configMap:
           name: cert-discovery-app-code
+      - name: data-volume
+        persistentVolumeClaim:
+          claimName: cert-discovery-data
       securityContext:
         runAsNonRoot: true
       restartPolicy: Always
@@ -902,6 +920,6 @@ spec:
     name: cert-discovery-service
     weight: 100
   port:
-    targetPort: 8080
+    targetPort: http
   wildcardPolicy: None
 
