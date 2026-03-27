@@ -231,19 +231,92 @@ These permissions are bound to the `cert-discovery-sa` ServiceAccount via a Clus
 
 **Historical Data:**
 - `/api/history` - List all certificate discovery runs (last 100)
-- `/api/history/<id>` - Get specific discovery run details
+- `/api/history/<id>` - Get specific discovery run details with all certificates
 - `/api/changes` - Compare last two discovery runs (shows added/removed/changed certificates)
 
-**Example:**
+**Examples:**
+
 ```bash
-# Get current certificates
-curl -k https://<route-url>/api/certificates | jq '.total'
+# Get current certificates with metadata
+curl -k https://<route-url>/api/certificates | jq
+{
+  "certificates": [...],
+  "cluster_name": "pm-lab-shpd5",
+  "last_update": "2026-03-27T11:29:05+00:00",
+  "total": 667
+}
 
 # View discovery history
-curl -k https://<route-url>/api/history | jq '.[0]'
+curl -k https://<route-url>/api/history | jq
+[
+  {
+    "id": 1,
+    "timestamp": "2026-03-27 11:29:05",
+    "cluster_name": "pm-lab-shpd5",
+    "total_certificates": 667,
+    "platform_managed": 662,
+    "user_managed": 5,
+    "auto_rotated": 667,
+    "discovery_duration_seconds": 5.56
+  }
+]
 
-# See what changed between last two scans
+# Get specific discovery run with all certificates
+curl -k https://<route-url>/api/history/1 | jq
+{
+  "discovery": {
+    "id": 1,
+    "timestamp": "2026-03-27 11:29:05",
+    "cluster_name": "pm-lab-shpd5",
+    "total_certificates": 667,
+    ...
+  },
+  "certificates": [
+    {
+      "id": 1,
+      "discovery_id": 1,
+      "namespace": "openshift-kube-apiserver",
+      "name": "serving-ca",
+      "resource_type": "secret",
+      "fingerprint": "ABC123...",
+      "issuer": "CN=openshift-kube-apiserver...",
+      "expiry": "Mar 27 12:00:00 2027 UTC",
+      "validity_years": 1,
+      "managed_status": "Platform-Managed (Auto-Rotated)",
+      "ca_category": "Platform-CA"
+    },
+    ...
+  ]
+}
+
+# See what changed between last two discovery runs
 curl -k https://<route-url>/api/changes | jq
+{
+  "older_discovery": {
+    "id": 1,
+    "timestamp": "2026-03-27 11:29:05"
+  },
+  "newer_discovery": {
+    "id": 2,
+    "timestamp": "2026-03-27 11:34:05"
+  },
+  "summary": {
+    "added": 2,
+    "removed": 1,
+    "changed": 3
+  },
+  "details": {
+    "added": [
+      {"namespace": "my-app", "name": "new-cert"}
+    ],
+    "removed": [
+      {"namespace": "old-ns", "name": "old-cert"}
+    ],
+    "changed": [
+      {"namespace": "openshift-ingress", "name": "router-cert"}
+    ]
+  }
+}
 ```
 
 ### Troubleshooting
