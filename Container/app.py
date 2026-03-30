@@ -13,7 +13,7 @@ import re
 import time
 import logging
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from threading import Thread, Lock
 from flask import Flask, render_template_string, jsonify
 from kubernetes import client, config
@@ -132,7 +132,7 @@ class CertificateCache:
             return self.data, self.cluster_name, self.last_update
 
 # Global cache instance (will be started after functions are defined)
-cert_cache = CertificateCache(refresh_interval=300)  # 5 minutes
+cert_cache = CertificateCache(refresh_interval=14400)  # 4 hours
 
 def init_database():
     """Initialize SQLite database with certificate tracking tables."""
@@ -192,6 +192,51 @@ def init_database():
         logger.error(f"Error initializing database: {e}", exc_info=True)
         return False
 
+def cleanup_old_discoveries(retention_days=30):
+    """Delete discovery runs older than retention_days."""
+    try:
+        if not os.path.exists(DB_PATH):
+            return
+
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        # Calculate cutoff date
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=retention_days)
+        cutoff_str = cutoff_date.strftime('%Y-%m-%d %H:%M:%S')
+
+        # Get IDs of discoveries to delete
+        cursor.execute('''
+            SELECT id FROM certificate_discoveries
+            WHERE timestamp < ?
+        ''', (cutoff_str,))
+
+        old_discovery_ids = [row[0] for row in cursor.fetchall()]
+
+        if old_discovery_ids:
+            # Delete associated certificates first (foreign key constraint)
+            cursor.execute(f'''
+                DELETE FROM certificates
+                WHERE discovery_id IN ({','.join('?' * len(old_discovery_ids))})
+            ''', old_discovery_ids)
+
+            deleted_certs = cursor.rowcount
+
+            # Delete old discoveries
+            cursor.execute(f'''
+                DELETE FROM certificate_discoveries
+                WHERE id IN ({','.join('?' * len(old_discovery_ids))})
+            ''', old_discovery_ids)
+
+            deleted_discoveries = cursor.rowcount
+
+            conn.commit()
+            logger.info(f"Cleaned up {deleted_discoveries} old discoveries (>{retention_days} days) and {deleted_certs} certificate records")
+
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error cleaning up old discoveries: {e}", exc_info=True)
+
 def save_discovery_to_db(certificates, cluster_name, duration):
     """Save discovery results to database."""
     try:
@@ -241,6 +286,10 @@ def save_discovery_to_db(certificates, cluster_name, duration):
         conn.close()
 
         logger.info(f"Saved discovery #{discovery_id} to database: {total} certificates")
+
+        # Cleanup old discoveries (keep last 30 days)
+        cleanup_old_discoveries(retention_days=30)
+
         return discovery_id
     except Exception as e:
         logger.error(f"Error saving discovery to database: {e}", exc_info=True)

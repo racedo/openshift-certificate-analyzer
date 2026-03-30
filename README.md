@@ -201,7 +201,8 @@ These permissions are bound to the `cert-discovery-sa` ServiceAccount via a Clus
 - Certificate parsing using cryptography library
 - Application code stored in ConfigMap
 - **SQLite database** on PersistentVolume for historical certificate tracking
-- **Background refresh thread** (5-minute interval) with automatic database saves
+- **Background refresh thread** (4-hour interval) with automatic database saves
+- **Automatic cleanup** of discoveries older than 30 days
 
 **Resource Requirements:**
 - CPU: 200m request, 1000m limit
@@ -210,15 +211,17 @@ These permissions are bound to the `cert-discovery-sa` ServiceAccount via a Clus
 
 ### Features
 
-**Real-time Certificate Discovery:**
+**Certificate Discovery:**
 - Scans all namespaces for certificates in secrets and configmaps
 - Analyzes certificate properties (issuer, expiry, fingerprint)
 - Classifies certificates as platform-managed vs user-managed
-- Updates automatically every 5 minutes via background thread
+- Updates automatically every 4 hours via background thread
+- In-memory cache for fast API responses
 
 **Historical Tracking:**
 - Stores discovery results in SQLite database on persistent volume
 - Tracks certificate changes over time (additions, removals, rotations)
+- Automatic retention management (keeps last 30 days)
 - Provides audit trail for compliance requirements
 - Survives pod restarts and maintains full history
 
@@ -402,11 +405,14 @@ oc exec -n cert-discovery-app deployment/cert-discovery-app -- \
 **Storage Estimates:**
 - ~1 KB per certificate record
 - ~667 certificates per discovery run (typical cluster)
-- 1 discovery every 5 minutes = 288 runs/day
-- Daily storage: ~192 MB
-- 30-day retention: ~5.8 GB
+- 1 discovery every 4 hours = 6 runs/day
+- Daily storage: ~4 MB
+- 30-day retention (automatic): ~120 MB
 
-The 10Gi PVC provides ample space for several months of historical data.
+**Data Retention:**
+- Automatic cleanup keeps only the last 30 days of discoveries
+- Older runs and their certificate records are automatically deleted
+- The 10Gi PVC provides plenty of space with room to grow
 
 ### Updating the Application Code
 
