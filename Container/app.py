@@ -796,18 +796,14 @@ def api_history():
         cursor = conn.cursor()
 
         cursor.execute('''
-            SELECT * FROM certificate_discoveries
+            SELECT id, timestamp, cluster_name, total_certificates as certificate_count,
+                   platform_managed, user_managed, auto_rotated, discovery_duration_seconds
+            FROM certificate_discoveries
             ORDER BY timestamp DESC
             LIMIT 100
         ''')
 
-        discoveries = []
-        for row in cursor.fetchall():
-            discovery = dict(row)
-            # Add certificate_count as alias for total_certificates for better API naming
-            discovery['certificate_count'] = discovery.get('total_certificates')
-            discoveries.append(discovery)
-
+        discoveries = [dict(row) for row in cursor.fetchall()]
         conn.close()
 
         return jsonify(discoveries)
@@ -828,7 +824,9 @@ def api_history_detail(discovery_id):
 
         # Get discovery metadata
         cursor.execute('''
-            SELECT * FROM certificate_discoveries
+            SELECT id, timestamp, cluster_name, total_certificates as certificate_count,
+                   platform_managed, user_managed, auto_rotated, discovery_duration_seconds
+            FROM certificate_discoveries
             WHERE id = ?
         ''', (discovery_id,))
 
@@ -846,12 +844,8 @@ def api_history_detail(discovery_id):
         certificates = [dict(row) for row in cursor.fetchall()]
         conn.close()
 
-        # Convert discovery to dict and add certificate_count alias
-        discovery_dict = dict(discovery)
-        discovery_dict['certificate_count'] = discovery_dict.get('total_certificates')
-
         return jsonify({
-            'discovery': discovery_dict,
+            'discovery': dict(discovery),
             'certificates': certificates
         })
     except Exception as e:
