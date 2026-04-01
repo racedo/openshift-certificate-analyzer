@@ -801,7 +801,13 @@ def api_history():
             LIMIT 100
         ''')
 
-        discoveries = [dict(row) for row in cursor.fetchall()]
+        discoveries = []
+        for row in cursor.fetchall():
+            discovery = dict(row)
+            # Add certificate_count as alias for total_certificates for better API naming
+            discovery['certificate_count'] = discovery.get('total_certificates')
+            discoveries.append(discovery)
+
         conn.close()
 
         return jsonify(discoveries)
@@ -840,8 +846,12 @@ def api_history_detail(discovery_id):
         certificates = [dict(row) for row in cursor.fetchall()]
         conn.close()
 
+        # Convert discovery to dict and add certificate_count alias
+        discovery_dict = dict(discovery)
+        discovery_dict['certificate_count'] = discovery_dict.get('total_certificates')
+
         return jsonify({
-            'discovery': dict(discovery),
+            'discovery': discovery_dict,
             'certificates': certificates
         })
     except Exception as e:
