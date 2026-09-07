@@ -119,6 +119,143 @@ get_cert_validity_days() {
     echo "0"
 }
 
+get_cert_cn() {
+    local cert_data="$1"
+    if [[ -z "$cert_data" ]]; then
+        echo ""
+        return
+    fi
+    local first_cert="$cert_data"
+    if [[ "$cert_data" == *"-----BEGIN CERTIFICATE-----"* ]]; then
+        first_cert=$(printf '%s\n' "$cert_data" | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' | head -n 200)
+    fi
+    printf '%s\n' "$first_cert" | openssl x509 -noout -subject 2>/dev/null | \
+        sed -n 's/.*[Cc][Nn] *= *//p' | sed 's/,.*//' | head -1
+}
+
+is_cert_ca() {
+    local cert_data="$1"
+    [[ -z "$cert_data" ]] && return 1
+    local first_cert="$cert_data"
+    if [[ "$cert_data" == *"-----BEGIN CERTIFICATE-----"* ]]; then
+        first_cert=$(printf '%s\n' "$cert_data" | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' | head -n 200)
+    fi
+    printf '%s\n' "$first_cert" | openssl x509 -noout -text 2>/dev/null | grep -q 'CA:TRUE'
+}
+
+is_ten_year_lifetime() {
+    local validity_days="${1:-0}"
+    [[ "$validity_days" =~ ^[0-9]+$ ]] || return 1
+    # OpenShift ~10y is 3650 days; floor so leap/rounding still counts. Rotating
+    # signers that reuse HyperShift names are 30d–5y.
+    [[ "$validity_days" -ge 3285 ]]
+}
+
+is_kas_no_rotate() {
+    case "$1" in
+        localhost-serving-signer|service-network-serving-signer|loadbalancer-serving-signer|localhost-recovery-serving-signer|localhost-recovery-serving-certkey) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_installer_no_rotate() {
+    case "$1" in
+        admin-kubeconfig-signer|kubelet-bootstrap-kubeconfig-signer) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_cno_operator_pki() {
+    case "$1" in ovn-ca|signer-ca) return 0 ;; *) return 1 ;; esac
+}
+
+is_hypershift_ten_year_ca() {
+    case "$1" in
+        root-ca|etcd-signer|etcd-metrics-signer|konnectivity-signer|aggregator-client-signer|kas-aggregator-client-signer|kube-control-plane-signer|kube-apiserver-to-kubelet-signer|system-admin-signer|hcco-signer|kube-csr-signer|cluster-signer-ca|csr-signer) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_known_non_rotate_cn() {
+    case "$1" in
+        kube-apiserver-localhost-signer|kube-apiserver-service-network-signer|kube-apiserver-lb-signer|localhost-recovery-serving-signer|kubelet-bootstrap-kubeconfig-signer|admin-kubeconfig-signer|kube-apiserver-to-kubelet-signer|kube-csr-signer|kube-control-plane-signer|root-ca|etcd-signer|etcd-metrics-signer|konnectivity-signer|aggregator-signer|hcco-signer) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_injected_ca_bundle() {
+    case "$1" in kube-root-ca.crt|openshift-service-ca.crt|service-ca.crt) return 0 ;; *) return 1 ;; esac
+}
+
+is_operator_copied_bundle() {
+    case "$1" in default-ingress-cert|assisted-trusted-ca-bundle|openshift-config-managed-trusted-ca-bundle|trusted-ca-bundle) return 0 ;; *) return 1 ;; esac
+}
+
+is_hypershift_referenced() {
+    local resource_json="$1"
+    echo "$resource_json" | jq -e '(.metadata.annotations // {}) | keys[]? | select(startswith("referenced-resource.hypershift.openshift.io/"))' >/dev/null 2>&1
+}
+
+determine_cert_role() {
+    local resource_type="$1"
+    local name="$2"
+    local has_private_key="$3"
+    local is_ca="$4"
+    if is_injected_ca_bundle "$name"; then echo "ca-bundle"; return; fi
+    if [[ "$resource_type" == "configmap" ]]; then echo "ca-bundle"; return; fi
+    if [[ "$has_private_key" != "true" ]] && { [[ "$name" == *-signer ]] || is_hypershift_ten_year_ca "$name" || [[ "$is_ca" == "true" ]]; }; then
+        echo "ca-bundle"; return
+    fi
+    if [[ "$name" == "localhost-recovery-serving-certkey" ]]; then echo "leaf"; return; fi
+    if is_kas_no_rotate "$name" || [[ "$is_ca" == "true" ]] || [[ "$name" == *-signer ]] || [[ "$name" == *serving-signer* ]]; then
+        echo "signer"; return
+    fi
+    echo "leaf"
+}
+
+# Sets NO_ROTATE_REASON. Return 0 if this secret will not auto-rotate.
+classify_no_auto_rotate() {
+    local name="$1"
+    local cert_role="$2"
+    local validity_days="$3"
+    local injected="$4"
+    local has_private_key="$5"
+    local cn="$6"
+    NO_ROTATE_REASON=""
+    if is_cno_operator_pki "$name" || [[ "$injected" == "true" ]]; then
+        return 1
+    fi
+    is_ten_year_lifetime "$validity_days" || return 1
+    if is_kas_no_rotate "$name"; then
+        NO_ROTATE_REASON="kas-10y"
+        return 0
+    fi
+    if is_installer_no_rotate "$name"; then
+        NO_ROTATE_REASON="installer-10y"
+        return 0
+    fi
+    if [[ "$cert_role" == "ca-bundle" || "$has_private_key" != "true" ]]; then
+        return 1
+    fi
+    if [[ "$cert_role" == "leaf" ]]; then
+        return 1
+    fi
+    if is_hypershift_ten_year_ca "$name" || is_known_non_rotate_cn "$cn"; then
+        NO_ROTATE_REASON="hypershift-10y"
+        return 0
+    fi
+    return 1
+}
+
+no_rotate_label() {
+    case "$1" in
+        kas-10y) echo "kube-apiserver 10-year signer" ;;
+        installer-10y) echo "Installer 10-year signer" ;;
+        hypershift-10y) echo "HyperShift 10-year CA" ;;
+        *) echo "" ;;
+    esac
+}
+
 # Function to check if certificate is signed by Service-CA
 is_service_ca_signed() {
     local issuer="$1"
@@ -521,171 +658,101 @@ process_resource() {
         is_platform_namespace=true
     fi
     
-    # Check if certificate has 10-year validity (signer CAs, root CAs)
-    local is_10_year=false
-    if [[ -n "$validity_years" && "$validity_years" =~ ^[0-9]+$ && "$validity_years" -eq 10 ]]; then
-        is_10_year=true
+    local has_private_key=false
+    if [[ -n "$tls_key" || -n "$cert_key" ]]; then
+        has_private_key=true
     fi
-    
-    # Determine managed status based on multiple indicators
-    # Priority: user-provided check > kube-root-ca.crt (special case) > owning-component > platform namespace > rotation annotation > managed label
-    
-    # FIRST: Check if this is a user-provided certificate
-    # User-provided certificates are NOT auto-rotated
-    if check_user_provided_certificate "$resource_type" "$name" "$namespace" "$resource_json"; then
+    local cn
+    cn=$(get_cert_cn "$cert_data")
+    local is_ca=false
+    if is_cert_ca "$cert_data"; then
+        is_ca=true
+    fi
+    local injected=false
+    if is_injected_ca_bundle "$name"; then
+        injected=true
+    fi
+    local cert_role
+    cert_role=$(determine_cert_role "$resource_type" "$name" "$has_private_key" "$is_ca")
+    local will_not_rotate=false
+    local no_rotate_reason=""
+    if classify_no_auto_rotate "$name" "$cert_role" "${validity_days:-0}" "$injected" "$has_private_key" "$cn"; then
+        will_not_rotate=true
+        no_rotate_reason="$NO_ROTATE_REASON"
+    fi
+
+    local platform_label="Platform-Managed (Auto-Rotated)"
+    if [[ "$will_not_rotate" == true ]]; then
+        platform_label="Platform-Managed (10-Year, Not Auto-Rotated)"
+    fi
+    local details="Issuer: ${issuer}; ${validity_days} days validity"
+
+    # Same rules as Container/app.py: user-managed first, then injected copies,
+    # then platform vs auto-rotate. owning-component does not imply rotation.
+    if is_hypershift_referenced "$resource_json" || \
+       check_user_provided_certificate "$resource_type" "$name" "$namespace" "$resource_json"; then
         managed_status="User-Managed (Not Auto-Rotated)"
-        # Build details - only certificate information from openssl
-        local details_parts=()
-        details_parts+=("User-provided certificate in openshift-config")
-        if [[ -n "$issuer" && "$issuer" != "N/A" ]]; then
-            details_parts+=("Issuer: $issuer")
-        fi
-        if [[ "$validity_days" -gt 0 ]]; then
-            details_parts+=("${validity_days} days validity")
-        fi
-        managed_details=$(IFS="; "; echo "${details_parts[*]}")
-    # SECOND: Special case for kube-root-ca.crt - Kubernetes automatically creates this in all namespaces
-    # It contains the same platform certificate bundle everywhere, so it's platform-managed
-    elif [[ "$resource_type" == "configmap" && "$name" == "kube-root-ca.crt" ]]; then
-        # kube-root-ca.crt is automatically created by Kubernetes in all namespaces
-        # It contains platform certificates, so it's platform-managed (but not auto-rotated by OpenShift operators)
-        if [[ "$is_10_year" == true ]]; then
-            managed_status="Platform-Managed (10-Year, Not Auto-Rotated)"
+        will_not_rotate=false
+        no_rotate_reason=""
+        if is_hypershift_referenced "$resource_json"; then
+            managed_details="HyperShift named serving cert (HostedCluster references this Secret; you rotate it); $details"
         else
-            managed_status="Platform-Managed (Auto-Rotated)"
+            managed_details="User-provided certificate in openshift-config; $details"
         fi
-        # Build details - only certificate information from openssl
-        local details_parts=()
-        details_parts+=("Kubernetes-managed configmap (kube-root-ca.crt) with platform certificates")
-        if [[ -n "$issuer" && "$issuer" != "N/A" ]]; then
-            details_parts+=("Issuer: $issuer")
-        fi
-        if [[ "$validity_days" -gt 0 ]]; then
-            details_parts+=("${validity_days} days validity")
-        fi
-        managed_details=$(IFS="; "; echo "${details_parts[*]}")
-    # THIRD: Check for openshift.io/owning-component annotation (strongest platform indicator)
+    elif is_injected_ca_bundle "$name"; then
+        managed_status="Platform-Managed (Auto-Rotated)"
+        managed_details="Injected CA replica (not the signer secret)"
+    elif is_operator_copied_bundle "$name"; then
+        managed_status="Platform-Managed (Auto-Rotated)"
+        managed_details="Operator-copied platform bundle; $details"
     elif [[ -n "$owning_component" ]]; then
-        # Strong indicator: openshift.io/owning-component annotation means platform-managed and auto-rotated
-        managed_status="Platform-Managed (Auto-Rotated)"
-        
-        # Build details - only certificate information from openssl
-        local details_parts=()
-        if [[ -n "$issuer" && "$issuer" != "N/A" ]]; then
-            details_parts+=("Issuer: $issuer")
-        fi
-        if [[ "$validity_days" -gt 0 ]]; then
-            details_parts+=("${validity_days} days validity")
-        fi
-        
-        managed_details=$(IFS="; "; echo "${details_parts[*]}")
-    # FOURTH: Check if in platform namespace (openshift-*, but NOT openshift-config)
+        managed_status="$platform_label"
+        managed_details="$details"
     elif [[ "$is_platform_namespace" == true ]]; then
-        # Platform namespace - certificates are typically managed
-        
-        if [[ "$is_10_year" == true ]]; then
-            # 10-year certificates are managed but NOT auto-rotated
-            managed_status="Platform-Managed (10-Year, Not Auto-Rotated)"
-        elif [[ -n "$cert_not_after" ]]; then
-            # Has rotation annotation - definitely auto-rotated
-            managed_status="Platform-Managed (Auto-Rotated)"
-        else
-            # Platform namespace - assume auto-rotated (most are)
-            managed_status="Platform-Managed (Auto-Rotated)"
-        fi
-        
-        # Build details - only certificate information from openssl
-        local details_parts=()
-        if [[ -n "$issuer" && "$issuer" != "N/A" ]]; then
-            details_parts+=("Issuer: $issuer")
-        fi
-        if [[ "$validity_days" -gt 0 ]]; then
-            details_parts+=("${validity_days} days validity")
-        fi
-        
-        managed_details=$(IFS="; "; echo "${details_parts[*]}")
-    # FIFTH: Check for rotation annotation (even if not in platform namespace)
+        managed_status="$platform_label"
+        managed_details="$details"
     elif [[ -n "$cert_not_after" ]]; then
-        # Has rotation annotation - definitely platform-managed and auto-rotated
         managed_status="Platform-Managed (Auto-Rotated)"
-        # Build details - only certificate information from openssl
-        local details_parts=()
-        if [[ -n "$issuer" && "$issuer" != "N/A" ]]; then
-            details_parts+=("Issuer: $issuer")
-        fi
-        if [[ "$validity_days" -gt 0 ]]; then
-            details_parts+=("${validity_days} days validity")
-        fi
-        managed_details=$(IFS="; "; echo "${details_parts[*]}")
-    # SIXTH: Check certificate signer analysis (backup method when annotations missing)
+        managed_details="$details"
     elif [[ -n "$issuer" && "$issuer" != "N/A" ]]; then
-        # Analyze certificate signer to determine management status
-        # NOTE: We cannot rely solely on validity period (2 years) as users can create their own CAs with 2-year validity
-        # We must check issuer patterns (Service-CA or Platform-CA) to determine platform management
-        local signer_details=""
-        
-        if is_service_ca_signed "$issuer" "$has_service_ca_bundle"; then
+        local issuer_lower
+        issuer_lower=$(printf '%s' "$issuer" | tr '[:upper:]' '[:lower:]')
+        if [[ "$issuer_lower" == *service-ca* || "$issuer_lower" == *openshift-service-serving-signer* ]]; then
             managed_status="Platform-Managed (Auto-Rotated)"
-            signer_details="Service-CA signed"
-            if [[ "$has_service_ca_bundle" == "true" ]]; then
-                signer_details+=" (has service-ca.crt bundle)"
-            fi
-            # Add validity info as supporting detail
-            if [[ "$validity_days" -gt 0 ]]; then
-                signer_details+="; ${validity_days} days validity"
-            fi
-        elif is_platform_ca_signed "$issuer" "$has_platform_ca_bundle"; then
-            # Check if this is a 10-year certificate (likely a CA signer)
-            if [[ "$is_10_year" == true ]]; then
-                managed_status="Platform-Managed (10-Year, Not Auto-Rotated)"
-            else
-                managed_status="Platform-Managed (Auto-Rotated)"
-            fi
-            signer_details="Platform-CA signed"
-            if [[ "$has_platform_ca_bundle" == "true" ]]; then
-                signer_details+=" (has ca-bundle.crt)"
-            fi
-            # Add validity info as supporting detail
-            if [[ "$validity_days" -gt 0 ]]; then
-                signer_details+="; ${validity_days} days validity"
-            fi
-        elif is_cluster_proxy_ca_signed "$issuer"; then
+            managed_details="Service-CA signed; ${validity_days} days validity"
+        elif [[ "$issuer_lower" == *cluster-proxy* ]]; then
             managed_status="Platform-Managed (Auto-Rotated)"
-            signer_details="Cluster-Proxy CA signed"
-            # Add validity info as supporting detail
-            if [[ "$validity_days" -gt 0 ]]; then
-                signer_details+="; ${validity_days} days validity"
-            fi
+            managed_details="Cluster-Proxy CA signed; ${validity_days} days validity"
+        elif [[ "$issuer_lower" == *etcd* || "$issuer_lower" == *kube-apiserver* || \
+                "$issuer_lower" == *kube-controller-manager* || "$issuer_lower" == *openshift* || \
+                "$issuer_lower" == *kubernetes* || "$issuer_lower" == *kube-csr-signer* || \
+                "$issuer_lower" == *cluster-manager-webhook* || "$issuer_lower" == *ingress-operator* || \
+                "$issuer_lower" == *root-ca* || "$issuer_lower" == *konnectivity* || \
+                "$issuer_lower" == *ovn* ]]; then
+            managed_status="$platform_label"
+            managed_details="Platform-CA signed; ${validity_days} days validity"
+        elif [[ -n "$managed_cert_type" ]]; then
+            managed_status="$platform_label"
+            managed_details="$details"
         else
-            # External/unknown signer - even with 2-year validity, assume user-managed
-            # Users can create their own CAs with 2-year validity, so issuer pattern is required
             managed_status="User-Managed (Not Auto-Rotated)"
-            signer_details="External/Unknown signer"
-            if [[ "$validity_days" -gt 0 ]]; then
-                signer_details+=" (${validity_days} days validity)"
-            fi
+            managed_details="$details"
         fi
-        
-        managed_details="Issuer: $issuer; $signer_details"
-    # SEVENTH: Check for managed label (even if not in platform namespace)
     elif [[ -n "$managed_cert_type" ]]; then
-        # Has managed label - still platform-managed
-        if [[ "$is_10_year" == true ]]; then
-            managed_status="Platform-Managed (10-Year, Not Auto-Rotated)"
-        else
-            managed_status="Platform-Managed (Auto-Rotated)"
-        fi
-        # Build details - only certificate information from openssl
-        local details_parts=()
-        if [[ -n "$issuer" && "$issuer" != "N/A" ]]; then
-            details_parts+=("Issuer: $issuer")
-        fi
-        if [[ "$validity_days" -gt 0 ]]; then
-            details_parts+=("${validity_days} days validity")
-        fi
-        managed_details=$(IFS="; "; echo "${details_parts[*]}")
+        managed_status="$platform_label"
+        managed_details="$details"
+    else
+        managed_status="User-Managed (Not Auto-Rotated)"
+        managed_details="$details"
     fi
-    # else: User-Managed (default) - certificates not in platform namespaces and without indicators
+    if [[ "$will_not_rotate" == true && "$managed_status" == Platform-Managed* ]]; then
+        local why
+        why=$(no_rotate_label "$no_rotate_reason")
+        if [[ -n "$why" ]]; then
+            managed_details="${why}; ${managed_details}"
+        fi
+    fi
+
     
     # Determine CA category from issuer and managed details
     local ca_category=""
@@ -959,15 +1026,10 @@ try:
                 
                 # If it's platform-managed in a platform namespace, mark this fingerprint as platform
                 if is_platform and 'Platform-Managed' in managed_status:
-                    if fingerprint not in fingerprint_status:
-                        fingerprint_status[fingerprint] = {
-                            'is_platform': True,
-                            'is_10_year': '10-Year' in managed_status
-                        }
-                    elif '10-Year' in managed_status:
-                        fingerprint_status[fingerprint]['is_10_year'] = True
+                    fingerprint_status[fingerprint] = {'is_platform': True}
     
-    # Update rows: if fingerprint is marked as platform, update all User-Managed instances
+    # Upgrade User-Managed copies of a platform PEM. Do not copy
+    # "will not auto-rotate" onto CA-bundle replicas of a 10-year signer.
     updated_count = 0
     for row in rows:
         fingerprint = row.get('Fingerprint', '').strip()
@@ -975,16 +1037,8 @@ try:
         
         if fingerprint and fingerprint != 'N/A' and 'User-Managed' in managed_status:
             if fingerprint in fingerprint_status and fingerprint_status[fingerprint]['is_platform']:
-                # This fingerprint appears as platform-managed elsewhere, upgrade this instance
-                is_10_year = fingerprint_status[fingerprint].get('is_10_year', False)
-                validity = row.get('Validity (years)', '').strip()
-                
-                if is_10_year or validity == '10':
-                    row['Managed Status'] = 'Platform-Managed (10-Year, Not Auto-Rotated)'
-                    row['Managed Details'] = 'Platform certificate (same fingerprint in platform namespaces)'
-                else:
-                    row['Managed Status'] = 'Platform-Managed (Auto-Rotated)'
-                    row['Managed Details'] = 'Platform certificate (same fingerprint in platform namespaces)'
+                row['Managed Status'] = 'Platform-Managed (Auto-Rotated)'
+                row['Managed Details'] = 'Platform certificate (same fingerprint in platform namespaces)'
                 updated_count += 1
     
     # Write updated CSV
@@ -1024,7 +1078,7 @@ echo "   - Data Fields: Available certificate data fields (tls.crt, ca.crt, ca-b
 echo "   - Validity (years): Certificate validity in years"
 echo "   - Actual Expiry: Certificate expiration date"
 echo "   - Fingerprint: SHA256 fingerprint of the certificate"
-echo "   - Managed Status: Platform-Managed (Auto-Rotated), Platform-Managed (10-Year, Not Auto-Rotated), or User-Managed (Not Auto-Rotated)"
+echo "   - Managed Status: Platform-Managed (Auto-Rotated), Platform-Managed (10-Year, Not Auto-Rotated) for platform signers that never refresh, or User-Managed (Not Auto-Rotated)"
 echo "   - Managed Details: Certificate issuer and validity information"
 echo "   - CA: CA/Signer category (Service-CA, Platform-CA, Cluster-Proxy CA, Kube-CSR-Signer, Cluster-Manager-Webhook, OVN CA, Monitoring CA, Konnectivity CA, Ingress CA, OLM CA, External CA, or Unknown)"
 echo "   - TLS Registry annotations: openshift.io/owning-component, auth.openshift.io/certificate-not-before, auth.openshift.io/certificate-not-after, etc."

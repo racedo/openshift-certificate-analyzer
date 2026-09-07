@@ -47,7 +47,7 @@ The script generates `all-cluster-certificates.csv` in the current directory wit
 - **Valid To**: Certificate expiration date
 - **Validity Days**: Number of days until expiration
 - **SHA256 Fingerprint**: Certificate fingerprint
-- **Managed Status**: Platform-Managed or User-Managed classification
+- **Managed Status**: Platform-Managed (Auto-Rotated), Platform-Managed (10-Year, Not Auto-Rotated) for kube-apiserver / installer / HyperShift signers that never refresh, or User-Managed (Not Auto-Rotated). A 10-year lifetime alone is not enough (CNO `ovn-ca` / `signer-ca` still rotate).
 - **Managed Details**: Additional management details (rotation policy, etc.)
 - **TLS Registry annotations**: Relevant TLS registry annotations
 - **CA Category**: CA type classification
