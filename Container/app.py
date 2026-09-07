@@ -512,7 +512,7 @@ def is_platform_namespace(namespace):
     return False
 
 # kube-apiserver foreverPeriod secrets: Refresh at 80% of 10y is 8y, so they never rotate.
-OCPSTRAT_1826_NO_ROTATE = frozenset({
+KAS_NO_ROTATE = frozenset({
     'localhost-serving-signer',
     'service-network-serving-signer',
     'loadbalancer-serving-signer',
@@ -561,7 +561,7 @@ OPERATOR_COPIED_BUNDLE_NAMES = frozenset({
 HYPERSHIFT_REFERENCED_PREFIX = 'referenced-resource.hypershift.openshift.io/'
 TEN_YEAR_MIN_DAYS = 3650 - 365
 NO_ROTATE_LABELS = {
-    'ocpstrat-1826': 'OCPSTRAT-1826 foreverPeriod',
+    'kas-10y': 'kube-apiserver 10-year signer',
     'installer-10y': 'Installer 10-year signer',
     'hypershift-10y': 'HyperShift 10-year CA',
 }
@@ -624,7 +624,7 @@ def determine_cert_role(resource_type, name, has_private_key, is_ca):
     if name == 'localhost-recovery-serving-certkey':
         return 'leaf'
     if (
-        name in OCPSTRAT_1826_NO_ROTATE
+        name in KAS_NO_ROTATE
         or is_ca
         or (name or '').endswith('-signer')
         or 'serving-signer' in (name or '')
@@ -643,8 +643,8 @@ def classify_no_auto_rotate(name, cert_role, validity_days, injected, has_privat
         return False, ''
     if not is_ten_year_lifetime(validity_days):
         return False, ''
-    if name in OCPSTRAT_1826_NO_ROTATE:
-        return True, 'ocpstrat-1826'
+    if name in KAS_NO_ROTATE:
+        return True, 'kas-10y'
     if name in INSTALLER_NO_ROTATE:
         return True, 'installer-10y'
     if cert_role == 'ca-bundle' or not has_private_key:
@@ -1137,7 +1137,10 @@ HTML_TEMPLATE = '''
             text-align: center;
             border: 1px solid #E0E0E0;
             box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+            cursor: pointer;
         }
+        .summary-card:hover { border-color: #007BFF; }
+        .summary-card.active { border-color: #007BFF; outline: 2px solid #007BFF; }
         .summary-card h3 {
             margin: 0 0 10px 0;
             color: #6A6A6A;
@@ -1171,6 +1174,19 @@ HTML_TEMPLATE = '''
             font-size: 0.85em;
             text-transform: uppercase;
             letter-spacing: 0.5px;
+            white-space: nowrap;
+        }
+        .cert-table th a {
+            color: #0066CC;
+            text-decoration: underline dotted #8A8A8A;
+        }
+        .cert-table th a:hover { text-decoration: underline; }
+        .cert-table th.row-num, .cert-table td.row-num {
+            width: 2.4em;
+            text-align: right;
+            color: #6A6A6A;
+            font-variant-numeric: tabular-nums;
+            white-space: nowrap;
         }
         .cert-table td {
             padding: 12px;
@@ -1278,23 +1294,23 @@ HTML_TEMPLATE = '''
     </div>
 
     <div class="summary">
-        <div class="summary-card">
+        <div class="summary-card active" data-filter="all" onclick="applyFilter('all')">
             <h3>Total Certificates</h3>
             <div class="summary-count">{{ total }}</div>
         </div>
-        <div class="summary-card">
+        <div class="summary-card" data-filter="platform" onclick="applyFilter('platform')">
             <h3>Platform-Managed</h3>
             <div class="summary-count" style="color: #1E4F18;">{{ platform_managed }}</div>
         </div>
-        <div class="summary-card">
+        <div class="summary-card" data-filter="tenyear" onclick="applyFilter('tenyear')">
             <h3>Will not auto-rotate</h3>
             <div class="summary-count" style="color: #A30000;">{{ will_not_rotate }}</div>
         </div>
-        <div class="summary-card">
+        <div class="summary-card" data-filter="usermanaged" onclick="applyFilter('usermanaged')">
             <h3>User-Managed</h3>
             <div class="summary-count" style="color: #002F5D;">{{ user_managed }}</div>
         </div>
-        <div class="summary-card">
+        <div class="summary-card" data-filter="autorotated" onclick="applyFilter('autorotated')">
             <h3>Auto-Rotated</h3>
             <div class="summary-count" style="color: #1E4F18;">{{ auto_rotated }}</div>
         </div>
@@ -1303,22 +1319,29 @@ HTML_TEMPLATE = '''
     <table class="cert-table">
         <thead>
             <tr>
-                <th>Resource Type</th>
-                <th>Name</th>
-                <th>Namespace</th>
-                <th>Data Fields</th>
-                <th>Validity (Years)</th>
-                <th>Expiry</th>
-                <th>Fingerprint</th>
-                <th>Managed Status</th>
-                <th>Managed Details</th>
-                <th>CA Category</th>
-                <th>TLS Registry annotations</th>
+                <th class="row-num">#</th>
+                <th><a href="#" onclick="return sortBy(1)">Resource Type</a></th>
+                <th><a href="#" onclick="return sortBy(2)">Name</a></th>
+                <th><a href="#" onclick="return sortBy(3)">Namespace</a></th>
+                <th><a href="#" onclick="return sortBy(4)">Data Fields</a></th>
+                <th><a href="#" onclick="return sortBy(5)">Validity (Years)</a></th>
+                <th><a href="#" onclick="return sortBy(6)">Expiry</a></th>
+                <th><a href="#" onclick="return sortBy(7)">Fingerprint</a></th>
+                <th><a href="#" onclick="return sortBy(8)">Managed Status</a></th>
+                <th><a href="#" onclick="return sortBy(9)">Managed Details</a></th>
+                <th><a href="#" onclick="return sortBy(10)">CA Category</a></th>
+                <th><a href="#" onclick="return sortBy(11)">TLS Registry annotations</a></th>
             </tr>
         </thead>
-        <tbody>
+        <tbody id="cert-body">
             {% for cert in certificates %}
-            <tr>
+            <tr
+                data-platform="{{ '1' if 'Platform-Managed' in cert.managed_status else '0' }}"
+                data-tenyear="{{ '1' if cert.will_not_auto_rotate else '0' }}"
+                data-usermanaged="{{ '1' if cert.user_managed else '0' }}"
+                data-autorotated="{{ '1' if 'Auto-Rotated' in cert.managed_status and 'Not Auto-Rotated' not in cert.managed_status else '0' }}"
+            >
+                <td class="row-num"></td>
                 <td>{{ cert.resource_type }}</td>
                 <td>{{ cert.name }}</td>
                 <td>{{ cert.namespace }}</td>
@@ -1349,6 +1372,63 @@ HTML_TEMPLATE = '''
     <div class="refresh-info">
         Page auto-refreshes every 5 minutes | Last updated: {{ generated_time }}
     </div>
+<script>
+function numberVisibleRows() {
+  var rows = document.querySelectorAll('#cert-body tr');
+  var n = 0;
+  for (var i = 0; i < rows.length; i++) {
+    var num = rows[i].querySelector('.row-num');
+    if (rows[i].style.display === 'none') {
+      if (num) num.textContent = '';
+    } else {
+      n++;
+      if (num) num.textContent = n;
+    }
+  }
+}
+function applyFilter(name) {
+  var rows = document.querySelectorAll('#cert-body tr');
+  for (var i = 0; i < rows.length; i++) {
+    var row = rows[i];
+    var show = true;
+    if (name === 'platform') show = row.getAttribute('data-platform') === '1';
+    else if (name === 'tenyear') show = row.getAttribute('data-tenyear') === '1';
+    else if (name === 'usermanaged') show = row.getAttribute('data-usermanaged') === '1';
+    else if (name === 'autorotated') show = row.getAttribute('data-autorotated') === '1';
+    row.style.display = show ? '' : 'none';
+  }
+  var chips = document.querySelectorAll('.summary-card');
+  for (var j = 0; j < chips.length; j++) {
+    if (chips[j].getAttribute('data-filter') === name) chips[j].classList.add('active');
+    else chips[j].classList.remove('active');
+  }
+  numberVisibleRows();
+}
+var sortAsc = {};
+function sortBy(col) {
+  var tbody = document.getElementById('cert-body');
+  var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));
+  sortAsc[col] = !sortAsc[col];
+  var asc = sortAsc[col];
+  rows.sort(function(a, b) {
+    var ta = (a.children[col] && a.children[col].innerText || '').trim();
+    var tb = (b.children[col] && b.children[col].innerText || '').trim();
+    var na = parseFloat(ta.replace(/,/g, ''));
+    var nb = parseFloat(tb.replace(/,/g, ''));
+    var cmp;
+    if (ta !== '' && tb !== '' && !isNaN(na) && !isNaN(nb) && /^[-0-9.]/.test(ta) && /^[-0-9.]/.test(tb)) {
+      cmp = na - nb;
+    } else {
+      cmp = ta.toLowerCase().localeCompare(tb.toLowerCase());
+    }
+    return asc ? cmp : -cmp;
+  });
+  for (var i = 0; i < rows.length; i++) tbody.appendChild(rows[i]);
+  numberVisibleRows();
+  return false;
+}
+applyFilter('all');
+</script>
 </body>
     </html>
 '''
