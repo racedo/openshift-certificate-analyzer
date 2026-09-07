@@ -19,6 +19,7 @@ from flask import Flask, render_template_string, jsonify
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 from cryptography import x509
+from cryptography.x509.oid import NameOID
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 
@@ -251,8 +252,8 @@ def save_discovery_to_db(certificates, cluster_name, duration):
         # Calculate statistics
         total = len(certificates)
         platform_managed = len([c for c in certificates if 'Platform-Managed' in c.get('managed_status', '')])
-        user_managed = len([c for c in certificates if 'User-Managed' in c.get('managed_status', '')])
-        auto_rotated = len([c for c in certificates if 'Auto-Rotated' in c.get('managed_status', '')])
+        user_managed = len([c for c in certificates if c.get('user_managed') or 'User-Managed' in c.get('managed_status', '')])
+        auto_rotated = len([c for c in certificates if is_auto_rotated_status(c.get('managed_status', ''))])
 
         # Insert discovery run
         cursor.execute('''
@@ -510,65 +511,207 @@ def is_platform_namespace(namespace):
         return True
     return False
 
-def determine_managed_status(resource_type, name, namespace, cert_data, issuer, validity_days, annotations, labels):
+# kube-apiserver foreverPeriod secrets: Refresh at 80% of 10y is 8y, so they never rotate.
+OCPSTRAT_1826_NO_ROTATE = frozenset({
+    'localhost-serving-signer',
+    'service-network-serving-signer',
+    'loadbalancer-serving-signer',
+    'localhost-recovery-serving-signer',
+    'localhost-recovery-serving-certkey',
+})
+INSTALLER_NO_ROTATE = frozenset({
+    'admin-kubeconfig-signer',
+    'kubelet-bootstrap-kubeconfig-signer',
+})
+# CNO OperatorPKI: 10y validity, refresh after 9y — they DO auto-rotate.
+CNO_OPERATOR_PKI_SIGNERS = frozenset({'ovn-ca', 'signer-ca'})
+HYPERSHIFT_TEN_YEAR_CAS = frozenset({
+    'root-ca', 'etcd-signer', 'etcd-metrics-signer', 'konnectivity-signer',
+    'aggregator-client-signer', 'kas-aggregator-client-signer',
+    'kube-control-plane-signer', 'kube-apiserver-to-kubelet-signer',
+    'system-admin-signer', 'hcco-signer', 'kube-csr-signer',
+    'cluster-signer-ca', 'csr-signer',
+})
+KNOWN_NON_ROTATE_CN = frozenset({
+    'kube-apiserver-localhost-signer',
+    'kube-apiserver-service-network-signer',
+    'kube-apiserver-lb-signer',
+    'localhost-recovery-serving-signer',
+    'kubelet-bootstrap-kubeconfig-signer',
+    'admin-kubeconfig-signer',
+    'kube-apiserver-to-kubelet-signer',
+    'kube-csr-signer',
+    'kube-control-plane-signer',
+    'root-ca',
+    'etcd-signer',
+    'etcd-metrics-signer',
+    'konnectivity-signer',
+    'aggregator-signer',
+    'hcco-signer',
+})
+INJECTED_CA_BUNDLE_NAMES = frozenset({
+    'kube-root-ca.crt', 'openshift-service-ca.crt', 'service-ca.crt',
+})
+OPERATOR_COPIED_BUNDLE_NAMES = frozenset({
+    'default-ingress-cert',
+    'assisted-trusted-ca-bundle',
+    'openshift-config-managed-trusted-ca-bundle',
+    'trusted-ca-bundle',
+})
+HYPERSHIFT_REFERENCED_PREFIX = 'referenced-resource.hypershift.openshift.io/'
+TEN_YEAR_MIN_DAYS = 3650 - 365
+NO_ROTATE_LABELS = {
+    'ocpstrat-1826': 'OCPSTRAT-1826 foreverPeriod',
+    'installer-10y': 'Installer 10-year signer',
+    'hypershift-10y': 'HyperShift 10-year CA',
+}
+
+
+def is_ten_year_lifetime(validity_days):
+    """True for OpenShift ~10-year CAs. Rotating signers that reuse these names are 30d–5y."""
+    return (validity_days or 0) >= TEN_YEAR_MIN_DAYS
+
+
+def is_hypershift_referenced(annotations):
+    return any((k or '').startswith(HYPERSHIFT_REFERENCED_PREFIX) for k in (annotations or {}))
+
+
+def load_first_x509(cert_data):
+    if not cert_data:
+        return None
+    if isinstance(cert_data, bytes):
+        cert_data = cert_data.decode('utf-8', errors='ignore')
+    start = cert_data.find('-----BEGIN CERTIFICATE-----')
+    end = cert_data.find('-----END CERTIFICATE-----', start)
+    if start == -1 or end == -1:
+        return None
+    pem = cert_data[start:end + len('-----END CERTIFICATE-----')]
+    try:
+        return x509.load_pem_x509_certificate(pem.encode(), default_backend())
+    except Exception:
+        return None
+
+
+def get_cert_cn(cert_data):
+    cert = load_first_x509(cert_data)
+    if cert is None:
+        return ''
+    for attr in cert.subject:
+        if attr.oid == NameOID.COMMON_NAME:
+            return attr.value or ''
+    return ''
+
+
+def get_cert_is_ca(cert_data):
+    cert = load_first_x509(cert_data)
+    if cert is None:
+        return False
+    try:
+        return bool(cert.extensions.get_extension_for_class(x509.BasicConstraints).value.ca)
+    except x509.ExtensionNotFound:
+        return False
+
+
+def determine_cert_role(resource_type, name, has_private_key, is_ca):
+    if name in INJECTED_CA_BUNDLE_NAMES:
+        return 'ca-bundle'
+    if resource_type == 'configmap':
+        return 'ca-bundle'
+    if not has_private_key and (
+        (name or '').endswith('-signer') or name in HYPERSHIFT_TEN_YEAR_CAS or is_ca
+    ):
+        return 'ca-bundle'
+    if name == 'localhost-recovery-serving-certkey':
+        return 'leaf'
+    if (
+        name in OCPSTRAT_1826_NO_ROTATE
+        or is_ca
+        or (name or '').endswith('-signer')
+        or 'serving-signer' in (name or '')
+    ):
+        return 'signer'
+    return 'leaf'
+
+
+def classify_no_auto_rotate(name, cert_role, validity_days, injected, has_private_key, cn):
+    """Platform signer secrets OpenShift will not auto-rotate.
+
+    A 10-year lifetime is not enough: CNO ovn-ca/signer-ca are 10y and do rotate.
+    CA-bundle copies and serving leaves that embed a 10y CA still rotate (or are replicas).
+    """
+    if name in CNO_OPERATOR_PKI_SIGNERS or injected:
+        return False, ''
+    if not is_ten_year_lifetime(validity_days):
+        return False, ''
+    if name in OCPSTRAT_1826_NO_ROTATE:
+        return True, 'ocpstrat-1826'
+    if name in INSTALLER_NO_ROTATE:
+        return True, 'installer-10y'
+    if cert_role == 'ca-bundle' or not has_private_key:
+        return False, ''
+    if cert_role == 'leaf':
+        return False, ''
+    if name in HYPERSHIFT_TEN_YEAR_CAS or cn in KNOWN_NON_ROTATE_CN:
+        return True, 'hypershift-10y'
+    return False, ''
+
+
+def is_auto_rotated_status(status):
+    s = status or ''
+    return 'Auto-Rotated' in s and 'Not Auto-Rotated' not in s
+
+
+def determine_managed_status(resource_type, name, namespace, cert_data, issuer, validity_days, annotations, labels, will_not_rotate=False):
     """Determine if certificate is platform-managed or user-managed."""
     owning_component = annotations.get('openshift.io/owning-component', '')
     cert_not_after = annotations.get('auth.openshift.io/certificate-not-after', '')
-    cert_not_before = annotations.get('auth.openshift.io/certificate-not-before', '')
     managed_cert_type = labels.get('auth.openshift.io/managed-certificate-type', '')
-    
-    # Check if 10-year certificate
-    is_10_year = validity_days >= 3650  # 10 years
-    
-    # User-provided certificates in openshift-config
-    if namespace == 'openshift-config' and resource_type == 'secret':
-        # Would need to check cluster config resources - simplified for now
-        pass
-    
-    # kube-root-ca.crt special case
-    if resource_type == 'configmap' and name == 'kube-root-ca.crt':
-        if is_10_year:
-            return "Platform-Managed (10-Year, Not Auto-Rotated)", "Kubernetes-managed configmap with platform certificates"
-        return "Platform-Managed (Auto-Rotated)", "Kubernetes-managed configmap with platform certificates"
-    
-    # Check owning-component annotation
+    platform_label = (
+        "Platform-Managed (10-Year, Not Auto-Rotated)"
+        if will_not_rotate else
+        "Platform-Managed (Auto-Rotated)"
+    )
+    details = f"Issuer: {issuer}; {validity_days} days validity"
+
+    if is_hypershift_referenced(annotations):
+        return (
+            "User-Managed (Not Auto-Rotated)",
+            "HyperShift named serving cert (HostedCluster references this Secret; "
+            f"you rotate it); {details}",
+        )
+
+    if name in INJECTED_CA_BUNDLE_NAMES:
+        return "Platform-Managed (Auto-Rotated)", "Injected CA replica (not the signer secret)"
+
+    if name in OPERATOR_COPIED_BUNDLE_NAMES:
+        return "Platform-Managed (Auto-Rotated)", f"Operator-copied platform bundle; {details}"
+
     if owning_component:
-        return "Platform-Managed (Auto-Rotated)", f"Issuer: {issuer}; {validity_days} days validity"
-    
-    # Check platform namespace
+        return platform_label, details
+
     if is_platform_namespace(namespace):
-        if is_10_year:
-            return "Platform-Managed (10-Year, Not Auto-Rotated)", f"Issuer: {issuer}; {validity_days} days validity"
-        if cert_not_after:
-            return "Platform-Managed (Auto-Rotated)", f"Issuer: {issuer}; {validity_days} days validity"
-        return "Platform-Managed (Auto-Rotated)", f"Issuer: {issuer}; {validity_days} days validity"
-    
-    # Check rotation annotation
+        return platform_label, details
+
     if cert_not_after:
-        return "Platform-Managed (Auto-Rotated)", f"Issuer: {issuer}; {validity_days} days validity"
-    
-    # Check issuer patterns (matching bash script logic)
-    issuer_lower = issuer.lower()
+        return "Platform-Managed (Auto-Rotated)", details
+
+    issuer_lower = (issuer or '').lower()
     if 'service-ca' in issuer_lower or 'openshift-service-serving-signer' in issuer_lower:
         return "Platform-Managed (Auto-Rotated)", f"Service-CA signed; {validity_days} days validity"
-    # Cluster-Proxy CA pattern: open-cluster-management:cluster-proxy
     if 'open-cluster-management:cluster-proxy' in issuer_lower or 'cluster-proxy' in issuer_lower:
         return "Platform-Managed (Auto-Rotated)", f"Cluster-Proxy CA signed; {validity_days} days validity"
-    # Platform-CA patterns: etcd, kube-apiserver, kube-controller-manager, openshift, kubernetes, kube-csr-signer, cluster-manager-webhook
-    platform_ca_patterns = ['etcd', 'kube-apiserver', 'kube-controller-manager', 'openshift', 'kubernetes', 'kube-csr-signer', 'cluster-manager-webhook']
+    platform_ca_patterns = [
+        'etcd', 'kube-apiserver', 'kube-controller-manager', 'openshift', 'kubernetes',
+        'kube-csr-signer', 'cluster-manager-webhook', 'ingress-operator', 'root-ca',
+        'konnectivity', 'ovn',
+    ]
     if any(pattern in issuer_lower for pattern in platform_ca_patterns):
-        if is_10_year:
-            return "Platform-Managed (10-Year, Not Auto-Rotated)", f"Platform-CA signed; {validity_days} days validity"
-        return "Platform-Managed (Auto-Rotated)", f"Platform-CA signed; {validity_days} days validity"
-    
-    # Check managed label
+        return platform_label, f"Platform-CA signed; {validity_days} days validity"
+
     if managed_cert_type:
-        if is_10_year:
-            return "Platform-Managed (10-Year, Not Auto-Rotated)", f"Issuer: {issuer}; {validity_days} days validity"
-        return "Platform-Managed (Auto-Rotated)", f"Issuer: {issuer}; {validity_days} days validity"
-    
-    # Default: User-Managed
-    return "User-Managed (Not Auto-Rotated)", f"Issuer: {issuer}; {validity_days} days validity"
+        return platform_label, details
+
+    return "User-Managed (Not Auto-Rotated)", details
 
 def process_resource(v1, resource_type, name, namespace):
     """Process a secret or configmap to extract certificate information."""
@@ -605,6 +748,7 @@ def process_resource(v1, resource_type, name, namespace):
             
             annotations = obj.metadata.annotations or {}
             labels = obj.metadata.labels or {}
+            has_private_key = 'tls.key' in data or 'cert.key' in data
             
         elif resource_type == 'configmap':
             v1_cm = client.CoreV1Api()
@@ -632,6 +776,7 @@ def process_resource(v1, resource_type, name, namespace):
             
             annotations = obj.metadata.annotations or {}
             labels = obj.metadata.labels or {}
+            has_private_key = False
         else:
             return None
         
@@ -651,9 +796,21 @@ def process_resource(v1, resource_type, name, namespace):
         
         validity_years = validity_days // 365 if validity_days > 0 else 0
         ca_category = determine_ca_category(issuer, annotations)
-        managed_status, managed_details = determine_managed_status(
-            resource_type, name, namespace, cert_data, issuer, validity_days, annotations, labels
+        cn = get_cert_cn(cert_data)
+        is_ca = get_cert_is_ca(cert_data)
+        injected = name in INJECTED_CA_BUNDLE_NAMES
+        cert_role = determine_cert_role(resource_type, name, has_private_key, is_ca)
+        will_not_rotate, no_rotate_reason = classify_no_auto_rotate(
+            name, cert_role, validity_days, injected, has_private_key, cn
         )
+        managed_status, managed_details = determine_managed_status(
+            resource_type, name, namespace, cert_data, issuer, validity_days,
+            annotations, labels, will_not_rotate=will_not_rotate
+        )
+        user_managed = 'User-Managed' in managed_status
+        if user_managed:
+            will_not_rotate = False
+            no_rotate_reason = ''
         
         # Build relevant annotations (one per line)
         relevant_annos = []
@@ -676,7 +833,12 @@ def process_resource(v1, resource_type, name, namespace):
             'managed_details': managed_details,
             'ca_category': ca_category,
             'relevant_annotations': '\n'.join(relevant_annos) if relevant_annos else '',
-            'issuer': issuer
+            'issuer': issuer,
+            'will_not_auto_rotate': will_not_rotate,
+            'no_rotate_reason': no_rotate_reason,
+            'no_rotate_label': NO_ROTATE_LABELS.get(no_rotate_reason, ''),
+            'user_managed': user_managed,
+            'has_private_key': has_private_key,
         }
     except ApiException as e:
         if e.status != 404:
@@ -735,11 +897,17 @@ def index():
         # Statistics
         total = len(certificates)
         platform_managed = len([c for c in certificates if c and 'Platform-Managed' in c.get('managed_status', '')])
-        user_managed = len([c for c in certificates if c and 'User-Managed' in c.get('managed_status', '')])
-        auto_rotated = len([c for c in certificates if c and 'Auto-Rotated' in c.get('managed_status', '')])
+        user_managed = len([c for c in certificates if c and (c.get('user_managed') or 'User-Managed' in c.get('managed_status', ''))])
+        auto_rotated = len([c for c in certificates if c and is_auto_rotated_status(c.get('managed_status', ''))])
+        will_not_rotate = len([c for c in certificates if c and c.get('will_not_auto_rotate')])
 
         # Filter out None values
         certificates = [c for c in certificates if c is not None]
+        certificates.sort(key=lambda c: (
+            0 if c.get('will_not_auto_rotate') else 1 if c.get('user_managed') else 2,
+            c.get('namespace') or '',
+            c.get('name') or '',
+        ))
 
         return render_template_string(HTML_TEMPLATE,
             certificates=certificates,
@@ -748,7 +916,8 @@ def index():
             total=total,
             platform_managed=platform_managed,
             user_managed=user_managed,
-            auto_rotated=auto_rotated
+            auto_rotated=auto_rotated,
+            will_not_rotate=will_not_rotate
         )
     except Exception as e:
         import traceback
@@ -757,6 +926,7 @@ def index():
         return f"<html><body><h1>Error</h1><pre>{error_msg}</pre></body></html>", 500
 
 @app.route('/health')
+@app.route('/healthz')
 def health():
     """Health check endpoint that verifies Kubernetes API connectivity."""
     try:
@@ -1013,35 +1183,42 @@ HTML_TEMPLATE = '''
         }
         .status-good { 
             background: #E8F5E9; 
-            color: #28A745;
-            font-weight: 400;
+            color: #1E4F18;
+            font-weight: 600;
             padding: 4px 8px;
             border-radius: 3px;
             display: inline-block;
         }
         .status-warning { 
             background: #FFF3CD; 
-            color: #FFC107;
+            color: #795600;
             font-weight: 400;
             padding: 4px 8px;
             border-radius: 3px;
             display: inline-block;
         }
         .status-critical { 
-            background: #F8D7DA; 
-            color: #DC3545;
-            font-weight: 400;
+            background: #FAEAE8; 
+            color: #A30000;
+            font-weight: 700;
             padding: 4px 8px;
             border-radius: 3px;
             display: inline-block;
         }
         .status-user {
-            background: #E9ECEF;
-            color: #6A6A6A;
-            font-weight: 400;
+            background: #E7F1FA;
+            color: #002F5D;
+            font-weight: 700;
             padding: 4px 8px;
             border-radius: 3px;
             display: inline-block;
+        }
+        .status-hint {
+            display: block;
+            margin-top: 4px;
+            font-size: 0.8em;
+            font-weight: 400;
+            color: #6A6A6A;
         }
         .info-box {
             background: #E6F7FF;
@@ -1092,7 +1269,9 @@ HTML_TEMPLATE = '''
 <body>
     <div class="header">
         <h1>🔐 OpenShift Certificate Discovery</h1>
-        <p>Cluster-wide certificate analysis using certificate discovery logic</p>
+        <p>Cluster-wide certificate inventory.
+            <span class="status-critical">Will not auto-rotate</span> is a platform signer OpenShift never refreshes.
+            <span class="status-user">User-managed</span> is one you supplied and must rotate yourself.</p>
         <div class="info-box">
             <strong>📊 Generated:</strong> {{ generated_time }} | <strong>Cluster:</strong> {{ cluster_name }}
         </div>
@@ -1105,15 +1284,19 @@ HTML_TEMPLATE = '''
         </div>
         <div class="summary-card">
             <h3>Platform-Managed</h3>
-            <div class="summary-count" style="color: #28A745;">{{ platform_managed }}</div>
+            <div class="summary-count" style="color: #1E4F18;">{{ platform_managed }}</div>
+        </div>
+        <div class="summary-card">
+            <h3>Will not auto-rotate</h3>
+            <div class="summary-count" style="color: #A30000;">{{ will_not_rotate }}</div>
         </div>
         <div class="summary-card">
             <h3>User-Managed</h3>
-            <div class="summary-count" style="color: #6A6A6A;">{{ user_managed }}</div>
+            <div class="summary-count" style="color: #002F5D;">{{ user_managed }}</div>
         </div>
         <div class="summary-card">
             <h3>Auto-Rotated</h3>
-            <div class="summary-count" style="color: #007BFF;">{{ auto_rotated }}</div>
+            <div class="summary-count" style="color: #1E4F18;">{{ auto_rotated }}</div>
         </div>
     </div>
 
@@ -1143,8 +1326,17 @@ HTML_TEMPLATE = '''
                 <td>{{ cert.validity_years }}</td>
                 <td>{{ cert.expiry }}</td>
                 <td style="font-family: monospace; font-size: 0.8em;">{{ cert.fingerprint[:16] }}...</td>
-                <td class="managed-status-cell {% if 'Platform-Managed' in cert.managed_status and 'Auto-Rotated' in cert.managed_status %}status-good{% elif 'Platform-Managed' in cert.managed_status and '10-Year' in cert.managed_status %}status-warning{% elif 'User-Managed' in cert.managed_status %}status-user{% else %}status-critical{% endif %}">
-                    {{ cert.managed_status }}
+                <td class="managed-status-cell">
+                    {% if cert.will_not_auto_rotate %}
+                    <span class="status-critical">Will not auto-rotate</span>
+                    {% if cert.no_rotate_label %}<span class="status-hint">{{ cert.no_rotate_label }}</span>{% endif %}
+                    {% elif cert.user_managed %}
+                    <span class="status-user">User-managed</span>
+                    {% elif 'Auto-Rotated' in cert.managed_status and 'Not Auto-Rotated' not in cert.managed_status %}
+                    <span class="status-good">Auto-rotated</span>
+                    {% else %}
+                    <span class="status-warning">{{ cert.managed_status }}</span>
+                    {% endif %}
                 </td>
                 <td class="managed-details-cell">{{ cert.managed_details }}</td>
                 <td>{{ cert.ca_category }}</td>
