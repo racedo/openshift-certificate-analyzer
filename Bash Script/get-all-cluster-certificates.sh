@@ -32,115 +32,73 @@ escape_csv() {
     echo "$value"
 }
 
-# Function to extract certificate fingerprint from certificate data
-get_cert_fingerprint() {
+# First PEM in a bundle. One sed, reused by a single openssl parse.
+extract_first_pem() {
     local cert_data="$1"
-    
-    if [[ -z "$cert_data" ]]; then
-        echo ""
-        return
-    fi
-    
-    # For bundles, extract first certificate
-    local first_cert="$cert_data"
     if [[ "$cert_data" == *"-----BEGIN CERTIFICATE-----"* ]]; then
-        # Extract first certificate from bundle
-        first_cert=$(echo "$cert_data" | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' | head -n 1000)
+        printf '%s\n' "$cert_data" | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' | head -n 200
+    else
+        printf '%s\n' "$cert_data"
     fi
-    
-    # Get SHA256 fingerprint
-    local fingerprint=$(echo "$first_cert" | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 | tr -d ':' | tr '[:lower:]' '[:upper:]')
-    
-    if [[ -z "$fingerprint" ]]; then
-        echo ""
-        return
-    fi
-    
-    echo "$fingerprint"
 }
 
-# Function to extract certificate issuer from certificate data
-get_cert_issuer() {
-    local cert_data="$1"
-    
-    if [[ -z "$cert_data" ]]; then
-        echo "N/A"
-        return
-    fi
-    
-    # For bundles, extract first certificate
-    local first_cert="$cert_data"
-    if [[ "$cert_data" == *"-----BEGIN CERTIFICATE-----"* ]]; then
-        # Extract first certificate from bundle
-        first_cert=$(echo "$cert_data" | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' | head -n 1000)
-    fi
-    
-    # Get issuer
-    local issuer=$(echo "$first_cert" | openssl x509 -noout -issuer 2>/dev/null | sed 's/issuer=//')
-    
-    if [[ -z "$issuer" ]]; then
-        echo "N/A"
-        return
-    fi
-    
-    echo "$issuer"
-}
-
-# Function to calculate certificate validity in days
-get_cert_validity_days() {
-    local cert_data="$1"
-    
-    if [[ -z "$cert_data" ]]; then
-        echo "0"
-        return
-    fi
-    
-    # For bundles, extract first certificate
-    local first_cert="$cert_data"
-    if [[ "$cert_data" == *"-----BEGIN CERTIFICATE-----"* ]]; then
-        # Extract first certificate from bundle
-        first_cert=$(echo "$cert_data" | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' | head -n 1000)
-    fi
-    
-    # Get validity dates
-    local valid_from=$(echo "$first_cert" | openssl x509 -noout -dates | grep "notBefore" | cut -d= -f2 2>/dev/null)
-    local valid_to=$(echo "$first_cert" | openssl x509 -noout -dates | grep "notAfter" | cut -d= -f2 2>/dev/null)
-    
-    if [[ -n "$valid_from" && -n "$valid_to" ]]; then
-        local valid_from_epoch=$(date -d "$valid_from" +%s 2>/dev/null || echo "0")
-        local valid_to_epoch=$(date -d "$valid_to" +%s 2>/dev/null || echo "0")
-        
-        if [[ "$valid_from_epoch" -gt 0 && "$valid_to_epoch" -gt 0 ]]; then
-            echo $(( (valid_to_epoch - valid_from_epoch) / 86400 ))
-            return
-        fi
-    fi
-    
-    echo "0"
-}
-
-get_cert_cn() {
-    local cert_data="$1"
-    if [[ -z "$cert_data" ]]; then
-        echo ""
-        return
-    fi
-    local first_cert="$cert_data"
-    if [[ "$cert_data" == *"-----BEGIN CERTIFICATE-----"* ]]; then
-        first_cert=$(printf '%s\n' "$cert_data" | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' | head -n 200)
-    fi
-    printf '%s\n' "$first_cert" | openssl x509 -noout -subject 2>/dev/null | \
-        sed -n 's/.*[Cc][Nn] *= *//p' | sed 's/,.*//' | head -1
-}
-
-is_cert_ca() {
+# One openssl invocation for subject/issuer/dates/fingerprint. Sets CERT_*.
+# CA:TRUE uses -ext basicConstraints (cheap); -text only if that flag is missing.
+parse_cert_once() {
+    CERT_FINGERPRINT=""
+    CERT_ISSUER="N/A"
+    CERT_SUBJECT=""
+    CERT_CN=""
+    CERT_NOT_BEFORE=""
+    CERT_NOT_AFTER=""
+    CERT_VALIDITY_DAYS=0
+    CERT_VALIDITY_YEARS=""
+    CERT_IS_CA=false
     local cert_data="$1"
     [[ -z "$cert_data" ]] && return 1
-    local first_cert="$cert_data"
-    if [[ "$cert_data" == *"-----BEGIN CERTIFICATE-----"* ]]; then
-        first_cert=$(printf '%s\n' "$cert_data" | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' | head -n 200)
+    local first_cert
+    first_cert=$(extract_first_pem "$cert_data")
+    [[ -z "$first_cert" ]] && return 1
+
+    local out line
+    out=$(printf '%s\n' "$first_cert" | openssl x509 -noout -subject -issuer -startdate -enddate -fingerprint -sha256 2>/dev/null) || return 1
+    while IFS= read -r line; do
+        case "$line" in
+            subject=*) CERT_SUBJECT="${line#subject=}" ;;
+            issuer=*) CERT_ISSUER="${line#issuer=}" ;;
+            notBefore=*) CERT_NOT_BEFORE="${line#notBefore=}" ;;
+            notAfter=*) CERT_NOT_AFTER="${line#notAfter=}" ;;
+            *Fingerprint=*|*fingerprint=*)
+                CERT_FINGERPRINT="${line#*=}"
+                CERT_FINGERPRINT="${CERT_FINGERPRINT//:/}"
+                CERT_FINGERPRINT=$(printf '%s' "$CERT_FINGERPRINT" | tr '[:lower:]' '[:upper:]')
+                ;;
+        esac
+    done <<< "$out"
+    [[ -z "$CERT_ISSUER" ]] && CERT_ISSUER="N/A"
+
+    CERT_CN=$(printf '%s\n' "$CERT_SUBJECT" | sed -n 's/.*[Cc][Nn] *= *//p' | sed 's/,.*//' | head -1)
+
+    local bc_ext=""
+    bc_ext=$(printf '%s\n' "$first_cert" | openssl x509 -noout -ext basicConstraints 2>/dev/null || true)
+    if [[ "$bc_ext" == *"CA:TRUE"* ]]; then
+        CERT_IS_CA=true
+    elif [[ "$bc_ext" == *"CA:FALSE"* || "$bc_ext" == *"CA:false"* ]]; then
+        CERT_IS_CA=false
+    elif printf '%s\n' "$first_cert" | openssl x509 -noout -text 2>/dev/null | grep -q 'CA:TRUE'; then
+        CERT_IS_CA=true
     fi
-    printf '%s\n' "$first_cert" | openssl x509 -noout -text 2>/dev/null | grep -q 'CA:TRUE'
+
+    if [[ -n "$CERT_NOT_BEFORE" && -n "$CERT_NOT_AFTER" ]]; then
+        local start_epoch expiry_epoch
+        start_epoch=$(date -d "$CERT_NOT_BEFORE" +%s 2>/dev/null || date -j -f "%b %d %H:%M:%S %Y %Z" "$CERT_NOT_BEFORE" +%s 2>/dev/null || echo "")
+        expiry_epoch=$(date -d "$CERT_NOT_AFTER" +%s 2>/dev/null || date -j -f "%b %d %H:%M:%S %Y %Z" "$CERT_NOT_AFTER" +%s 2>/dev/null || echo "")
+        if [[ -n "$start_epoch" && -n "$expiry_epoch" && "$start_epoch" -gt 0 && "$expiry_epoch" -gt 0 ]]; then
+            CERT_VALIDITY_DAYS=$(( (expiry_epoch - start_epoch) / 86400 ))
+            CERT_VALIDITY_YEARS=$((CERT_VALIDITY_DAYS / 365))
+        fi
+    fi
+    return 0
 }
 
 is_ten_year_lifetime() {
@@ -395,37 +353,6 @@ is_auto_rotated_by_validity() {
     return 1
 }
 
-# Function to extract certificate validity from certificate data
-get_cert_validity() {
-    local cert_data="$1"
-    
-    if [[ -z "$cert_data" ]]; then
-        echo ""
-        return
-    fi
-    
-    # Try to parse certificate
-    local expiry_raw=$(echo "$cert_data" | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
-    local start_raw=$(echo "$cert_data" | openssl x509 -noout -startdate 2>/dev/null | cut -d= -f2)
-    
-    if [[ -z "$expiry_raw" || -z "$start_raw" ]]; then
-        echo ""
-        return
-    fi
-    
-    # Calculate validity period
-    local expiry_epoch=$(date -d "$expiry_raw" +%s 2>/dev/null || date -j -f "%b %d %H:%M:%S %Y %Z" "$expiry_raw" +%s 2>/dev/null)
-    local start_epoch=$(date -d "$start_raw" +%s 2>/dev/null || date -j -f "%b %d %H:%M:%S %Y %Z" "$start_raw" +%s 2>/dev/null)
-    
-    if [[ -n "$expiry_epoch" && -n "$start_epoch" ]]; then
-        local validity_days=$(( (expiry_epoch - start_epoch) / 86400 ))
-        local validity_years=$((validity_days / 365))
-        echo "$validity_years|$expiry_raw"
-    else
-        echo ""
-    fi
-}
-
 # Function to check if a certificate is user-provided
 # User-provided certificates are in openshift-config namespace and referenced in cluster config resources
 # This function caches cluster config resources to avoid repeated API calls
@@ -496,38 +423,56 @@ check_user_provided_certificate() {
 process_resource() {
     local resource_type="$1"
     local resource_json="$2"
-    
-    local name=$(echo "$resource_json" | jq -r '.metadata.name // ""')
-    local namespace=$(echo "$resource_json" | jq -r '.metadata.namespace // ""')
-    
+
+    local name namespace secret_type tls_crt ca_crt ca_bundle cert_crt
+    local has_tls_key has_cert_key has_service_ca_bundle has_platform_ca_bundle
+    local cert_not_after cert_not_before owning_component managed_cert_type
+    local jira_component description hs_ref
+    eval "$(printf '%s' "$resource_json" | jq -r '
+      def a($k): (.metadata.annotations // {})[$k] // "";
+      def l($k): (.metadata.labels // {})[$k] // "";
+      [
+        "name=\(.metadata.name // "" | @sh)",
+        "namespace=\(.metadata.namespace // "" | @sh)",
+        "secret_type=\(.type // "" | @sh)",
+        "tls_crt=\(.data["tls.crt"] // "" | @sh)",
+        "ca_crt=\(.data["ca.crt"] // "" | @sh)",
+        "ca_bundle=\(.data["ca-bundle.crt"] // "" | @sh)",
+        "cert_crt=\(.data["cert.crt"] // "" | @sh)",
+        "has_tls_key=\(if (.data["tls.key"] // "") != "" then "true" else "false" end)",
+        "has_cert_key=\(if (.data["cert.key"] // "") != "" then "true" else "false" end)",
+        "has_service_ca_bundle=\(if (.data | has("service-ca.crt")) then "true" else "false" end)",
+        "has_platform_ca_bundle=\(if (.data | has("ca-bundle.crt") or has("ca.crt")) then "true" else "false" end)",
+        "cert_not_after=\(a("auth.openshift.io/certificate-not-after") | @sh)",
+        "cert_not_before=\(a("auth.openshift.io/certificate-not-before") | @sh)",
+        "owning_component=\(a("openshift.io/owning-component") | @sh)",
+        "managed_cert_type=\(l("auth.openshift.io/managed-certificate-type") | @sh)",
+        "jira_component=\(a("operator.openshift.io/jira-component") | @sh)",
+        "description=\(a("operator.openshift.io/description") | @sh)",
+        "hs_ref=\(if any((.metadata.annotations // {}) | keys[]; startswith("referenced-resource.hypershift.openshift.io/")) then "1" else "0" end)"
+      ] | join("\n")
+    ' 2>/dev/null)" || return 1
+
     if [[ -z "$name" || -z "$namespace" ]]; then
-        return
+        return 1
     fi
     
     # Extract data fields that might contain certificates
     local data_fields=""
     local has_cert_data=false
     
-    # Check for certificate-related data fields
-    local tls_crt=$(echo "$resource_json" | jq -r '.data."tls.crt" // empty')
-    local tls_key=$(echo "$resource_json" | jq -r '.data."tls.key" // empty')
-    local ca_crt=$(echo "$resource_json" | jq -r '.data."ca.crt" // empty')
-    local ca_bundle=$(echo "$resource_json" | jq -r '.data."ca-bundle.crt" // empty')
-    local cert_crt=$(echo "$resource_json" | jq -r '.data."cert.crt" // empty')
-    local cert_key=$(echo "$resource_json" | jq -r '.data."cert.key" // empty')
-    
     # Build data fields list
     local fields=()
     [[ -n "$tls_crt" ]] && fields+=("tls.crt") && has_cert_data=true
-    [[ -n "$tls_key" ]] && fields+=("tls.key")
+    [[ "$has_tls_key" == "true" ]] && fields+=("tls.key")
     [[ -n "$ca_crt" ]] && fields+=("ca.crt") && has_cert_data=true
     [[ -n "$ca_bundle" ]] && fields+=("ca-bundle.crt") && has_cert_data=true
     [[ -n "$cert_crt" ]] && fields+=("cert.crt") && has_cert_data=true
-    [[ -n "$cert_key" ]] && fields+=("cert.key")
+    [[ "$has_cert_key" == "true" ]] && fields+=("cert.key")
     
     # Skip if no certificate data
     if [[ "$has_cert_data" == false ]]; then
-        return
+        return 1
     fi
     
     data_fields=$(IFS=","; echo "${fields[*]}")
@@ -536,15 +481,18 @@ process_resource() {
     local cert_data=""
     local validity_years=""
     local actual_expiry=""
+    local fingerprint=""
+    local issuer="N/A"
+    local validity_days=0
     
     if [[ "$resource_type" == "secret" ]]; then
         # For secrets, data is base64 encoded in JSON
         if [[ -n "$tls_crt" ]]; then
-            cert_data=$(echo "$tls_crt" | base64 -d 2>/dev/null)
+            cert_data=$(printf '%s' "$tls_crt" | base64 -d 2>/dev/null)
         elif [[ -n "$ca_crt" ]]; then
-            cert_data=$(echo "$ca_crt" | base64 -d 2>/dev/null)
+            cert_data=$(printf '%s' "$ca_crt" | base64 -d 2>/dev/null)
         elif [[ -n "$cert_crt" ]]; then
-            cert_data=$(echo "$cert_crt" | base64 -d 2>/dev/null)
+            cert_data=$(printf '%s' "$cert_crt" | base64 -d 2>/dev/null)
         fi
     elif [[ "$resource_type" == "configmap" ]]; then
         # For configmaps, data is plain text in JSON
@@ -559,26 +507,15 @@ process_resource() {
         fi
     fi
     
-    # Get validity information and fingerprint
-    local fingerprint=""
+    CERT_CN=""
+    CERT_IS_CA=false
     if [[ -n "$cert_data" ]]; then
-        local validity_info=$(get_cert_validity "$cert_data")
-        if [[ -n "$validity_info" ]]; then
-            validity_years=$(echo "$validity_info" | cut -d'|' -f1)
-            actual_expiry=$(echo "$validity_info" | cut -d'|' -f2)
-        fi
-        # Get fingerprint from certificate data (already have it, no extra API call needed)
-        fingerprint=$(get_cert_fingerprint "$cert_data")
-        
-        # Get certificate issuer for signer analysis
-        issuer=$(get_cert_issuer "$cert_data")
-        
-        # Get certificate validity in days for rotation analysis
-        validity_days=$(get_cert_validity_days "$cert_data")
-        
-        # Check for CA bundles
-        has_service_ca_bundle=$(echo "$resource_json" | jq -r '.data | has("service-ca.crt")')
-        has_platform_ca_bundle=$(echo "$resource_json" | jq -r '.data | has("ca-bundle.crt") or .data | has("ca.crt")')
+        parse_cert_once "$cert_data"
+        fingerprint="$CERT_FINGERPRINT"
+        issuer="$CERT_ISSUER"
+        validity_days="${CERT_VALIDITY_DAYS:-0}"
+        validity_years="$CERT_VALIDITY_YEARS"
+        actual_expiry="$CERT_NOT_AFTER"
     fi
     
     # Build commands
@@ -609,14 +546,6 @@ process_resource() {
     # Check if certificate is managed by OpenShift
     local managed_status="User-Managed"
     local managed_details=""
-    
-    # Check for managed certificate indicators
-    local cert_not_after=$(echo "$resource_json" | jq -r '.metadata.annotations."auth.openshift.io/certificate-not-after" // empty')
-    local cert_not_before=$(echo "$resource_json" | jq -r '.metadata.annotations."auth.openshift.io/certificate-not-before" // empty')
-    local owning_component=$(echo "$resource_json" | jq -r '.metadata.annotations."openshift.io/owning-component" // empty')
-    local managed_cert_type=$(echo "$resource_json" | jq -r '.metadata.labels."auth.openshift.io/managed-certificate-type" // empty')
-    local jira_component=$(echo "$resource_json" | jq -r '.metadata.annotations."operator.openshift.io/jira-component" // empty')
-    local description=$(echo "$resource_json" | jq -r '.metadata.annotations."operator.openshift.io/description" // empty')
     
     # Build relevant annotations for the new column
     local relevant_annotations=""
@@ -659,13 +588,12 @@ process_resource() {
     fi
     
     local has_private_key=false
-    if [[ -n "$tls_key" || -n "$cert_key" ]]; then
+    if [[ "$has_tls_key" == "true" || "$has_cert_key" == "true" ]]; then
         has_private_key=true
     fi
-    local cn
-    cn=$(get_cert_cn "$cert_data")
+    local cn="$CERT_CN"
     local is_ca=false
-    if is_cert_ca "$cert_data"; then
+    if [[ "$CERT_IS_CA" == "true" ]]; then
         is_ca=true
     fi
     local injected=false
@@ -689,12 +617,12 @@ process_resource() {
 
     # Same rules as Container/app.py: user-managed first, then injected copies,
     # then platform vs auto-rotate. owning-component does not imply rotation.
-    if is_hypershift_referenced "$resource_json" || \
+    if [[ "$hs_ref" == "1" ]] || \
        check_user_provided_certificate "$resource_type" "$name" "$namespace" "$resource_json"; then
         managed_status="User-Managed (Not Auto-Rotated)"
         will_not_rotate=false
         no_rotate_reason=""
-        if is_hypershift_referenced "$resource_json"; then
+        if [[ "$hs_ref" == "1" ]]; then
             managed_details="HyperShift named serving cert (HostedCluster references this Secret; you rotate it); $details"
         else
             managed_details="User-provided certificate in openshift-config; $details"
@@ -788,7 +716,8 @@ process_resource() {
     csv_line+="$(escape_csv "$oc_command"),"
     csv_line+="$(escape_csv "$openssl_command")"
     
-    echo "$csv_line"
+    echo "$csv_line" >> "$CSV_FILE"
+    return 0
 }
 
 # Initialize CSV file with headers
@@ -806,22 +735,13 @@ if [[ $? -ne 0 ]]; then
     exit 1
 fi
 
-# Process secrets one by one from the JSON array, handling parse errors
 total_secrets=0
 cert_secrets=0
 
-# Use jq to extract each secret individually, which handles parse errors better
-secret_count=$(jq -r '[.items[] | select(.data != null)] | length' "$TEMP_SECRETS" 2>/dev/null || echo "0")
-
-# Check if JSON parsing failed - if so, use fallback immediately
+# Stream .items[] once. Do not use jq -c ".items[$i]" (that re-parses the
+# whole dump once per secret — O(n²) on large clusters).
 if ! jq -e '.items' "$TEMP_SECRETS" >/dev/null 2>&1; then
     echo -e "${YELLOW}⚠️  JSON parse error detected. Using fallback method...${NC}"
-    secret_count="0"
-fi
-
-if [[ "$secret_count" == "0" ]]; then
-    echo -e "${YELLOW}⚠️  No secrets found or JSON parse error. Trying alternative method...${NC}"
-    # Fallback: get secret names and process individually but still efficiently (avoid subshell for counting)
     TEMP_SECRET_LIST=$(mktemp)
     oc get secrets --all-namespaces -o custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name --no-headers 2>/dev/null > "$TEMP_SECRET_LIST"
     while IFS=$' \t' read -r namespace name rest; do
@@ -829,59 +749,23 @@ if [[ "$secret_count" == "0" ]]; then
             continue
         fi
         ((total_secrets++))
-        # Quick check if secret has certificate fields using jsonpath
         has_cert=$(oc get secret -n "$namespace" "$name" -o jsonpath='{.data}' 2>/dev/null | jq -r 'keys | map(select(. == "tls.crt" or . == "ca.crt" or . == "cert.crt" or . == "ca-bundle.crt")) | length' 2>/dev/null || echo "0")
         if [[ "$has_cert" -gt 0 ]]; then
-            # Get full secret JSON for this resource only
             secret_json=$(oc get secret -n "$namespace" "$name" -o json 2>/dev/null)
-            if [[ -n "$secret_json" ]]; then
-                result=$(process_resource "secret" "$secret_json" 2>/dev/null)
-                if [[ -n "$result" ]]; then
-                    echo "$result" >> "$CSV_FILE"
-                    ((cert_secrets++))
-                fi
+            if [[ -n "$secret_json" ]] && process_resource "secret" "$secret_json" 2>/dev/null; then
+                ((cert_secrets++))
             fi
         fi
     done < "$TEMP_SECRET_LIST"
     rm -f "$TEMP_SECRET_LIST"
 else
-    # Process using JSON, but handle parse errors gracefully
     echo -e "${YELLOW}📋 Processing secrets with certificate data...${NC}"
-    
-    # Extract valid secrets individually to handle parse errors
-    secret_index=0
-    while true; do
-        secret_json=$(jq -c ".items[$secret_index]" "$TEMP_SECRETS" 2>/dev/null)
-        if [[ -z "$secret_json" || "$secret_json" == "null" ]]; then
-            break
+    total_secrets=$(jq '.items | length' "$TEMP_SECRETS" 2>/dev/null || echo "0")
+    while IFS= read -r secret_json; do
+        if process_resource "secret" "$secret_json" 2>/dev/null; then
+            ((cert_secrets++))
         fi
-        
-        # Skip if this secret has parse errors
-        if ! echo "$secret_json" | jq -e '.metadata.name' >/dev/null 2>&1; then
-            ((secret_index++))
-            continue
-        fi
-        
-        ((total_secrets++))
-        
-        # Check if this secret has certificate data fields
-        has_cert_fields=$(echo "$secret_json" | jq -r 'if .data != null then (.data | keys | map(select(. == "tls.crt" or . == "ca.crt" or . == "cert.crt" or . == "ca-bundle.crt")) | length) else 0 end' 2>/dev/null || echo "0")
-        
-        if [[ "$has_cert_fields" -gt 0 ]]; then
-            # Verify it actually has a certificate field (not just kubeconfig)
-            has_cert=$(echo "$secret_json" | jq -r '.data | keys | map(select(. == "tls.crt" or . == "ca.crt" or . == "cert.crt" or . == "ca-bundle.crt")) | length' 2>/dev/null || echo "0")
-            if [[ "$has_cert" -gt 0 ]]; then
-                # Verify it has certificate data by checking process_resource output
-                result=$(process_resource "secret" "$secret_json" 2>/dev/null)
-                if [[ -n "$result" ]]; then
-                    echo "$result" >> "$CSV_FILE"
-                    ((cert_secrets++))
-                fi
-            fi
-        fi
-        
-        ((secret_index++))
-    done
+    done < <(jq -c '.items[]? | select(.data != null) | select(.data | has("tls.crt") or has("ca.crt") or has("cert.crt") or has("ca-bundle.crt"))' "$TEMP_SECRETS")
 fi
 
 rm -f "$TEMP_SECRETS"
@@ -898,22 +782,11 @@ if [[ $? -ne 0 ]]; then
     exit 1
 fi
 
-# Process configmaps one by one from the JSON array, handling parse errors
 total_configmaps=0
 cert_configmaps=0
 
-# Use jq to extract each configmap individually, which handles parse errors better
-configmap_count=$(jq -r '[.items[] | select(.data != null)] | length' "$TEMP_CONFIGMAPS" 2>/dev/null || echo "0")
-
-# Check if JSON parsing failed - if so, use fallback immediately
 if ! jq -e '.items' "$TEMP_CONFIGMAPS" >/dev/null 2>&1; then
-    echo -e "${YELLOW}⚠️  JSON parse error detected. Using fallback method...${NC}"
-    configmap_count="0"
-fi
-
-if [[ "$configmap_count" == "0" ]]; then
     echo -e "${YELLOW}⚠️  Using fallback method for configmaps...${NC}"
-    # Fallback: get configmap names and process individually (avoid subshell for counting)
     TEMP_CONFIGMAP_LIST=$(mktemp)
     oc get configmaps --all-namespaces -o custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name --no-headers 2>/dev/null > "$TEMP_CONFIGMAP_LIST"
     while IFS=$' \t' read -r namespace name rest; do
@@ -921,59 +794,23 @@ if [[ "$configmap_count" == "0" ]]; then
             continue
         fi
         ((total_configmaps++))
-        # Quick check if configmap has certificate fields
         has_cert=$(oc get configmap -n "$namespace" "$name" -o jsonpath='{.data}' 2>/dev/null | jq -r 'keys | map(select(. == "tls.crt" or . == "ca.crt" or . == "cert.crt" or . == "ca-bundle.crt")) | length' 2>/dev/null || echo "0")
         if [[ "$has_cert" -gt 0 ]]; then
-            # Get full configmap JSON for this resource only
             configmap_json=$(oc get configmap -n "$namespace" "$name" -o json 2>/dev/null)
-            if [[ -n "$configmap_json" ]]; then
-                result=$(process_resource "configmap" "$configmap_json" 2>/dev/null)
-                if [[ -n "$result" ]]; then
-                    echo "$result" >> "$CSV_FILE"
-                    ((cert_configmaps++))
-                fi
+            if [[ -n "$configmap_json" ]] && process_resource "configmap" "$configmap_json" 2>/dev/null; then
+                ((cert_configmaps++))
             fi
         fi
     done < "$TEMP_CONFIGMAP_LIST"
     rm -f "$TEMP_CONFIGMAP_LIST"
 else
-    # Process using JSON, but handle parse errors gracefully
     echo -e "${YELLOW}📋 Processing configmaps with certificate data...${NC}"
-    
-    # Extract valid configmaps individually to handle parse errors
-    configmap_index=0
-    while true; do
-        configmap_json=$(jq -c ".items[$configmap_index]" "$TEMP_CONFIGMAPS" 2>/dev/null)
-        if [[ -z "$configmap_json" || "$configmap_json" == "null" ]]; then
-            break
+    total_configmaps=$(jq '.items | length' "$TEMP_CONFIGMAPS" 2>/dev/null || echo "0")
+    while IFS= read -r configmap_json; do
+        if process_resource "configmap" "$configmap_json" 2>/dev/null; then
+            ((cert_configmaps++))
         fi
-        
-        # Skip if this configmap has parse errors
-        if ! echo "$configmap_json" | jq -e '.metadata.name' >/dev/null 2>&1; then
-            ((configmap_index++))
-            continue
-        fi
-        
-        ((total_configmaps++))
-        
-        # Check if this configmap has certificate data fields
-        has_cert_fields=$(echo "$configmap_json" | jq -r 'if .data != null then (.data | keys | map(select(. == "tls.crt" or . == "ca.crt" or . == "cert.crt" or . == "ca-bundle.crt")) | length) else 0 end' 2>/dev/null || echo "0")
-        
-        if [[ "$has_cert_fields" -gt 0 ]]; then
-            # Verify it actually has a certificate field
-            has_cert=$(echo "$configmap_json" | jq -r '.data | keys | map(select(. == "tls.crt" or . == "ca.crt" or . == "cert.crt" or . == "ca-bundle.crt")) | length' 2>/dev/null || echo "0")
-            if [[ "$has_cert" -gt 0 ]]; then
-                # Verify it has certificate data by checking process_resource output
-                result=$(process_resource "configmap" "$configmap_json" 2>/dev/null)
-                if [[ -n "$result" ]]; then
-                    echo "$result" >> "$CSV_FILE"
-                    ((cert_configmaps++))
-                fi
-            fi
-        fi
-        
-        ((configmap_index++))
-    done
+    done < <(jq -c '.items[]? | select(.data != null) | select(.data | has("tls.crt") or has("ca.crt") or has("cert.crt") or has("ca-bundle.crt"))' "$TEMP_CONFIGMAPS")
 fi
 
 rm -f "$TEMP_CONFIGMAPS"
