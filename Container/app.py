@@ -1302,10 +1302,6 @@ HTML_TEMPLATE = '''
             <h3>Platform-Managed</h3>
             <div class="summary-count" style="color: #1E4F18;">{{ platform_managed }}</div>
         </div>
-        <div class="summary-card" data-filter="tenyear" onclick="applyFilter('tenyear')">
-            <h3>Will not auto-rotate</h3>
-            <div class="summary-count" style="color: #A30000;">{{ will_not_rotate }}</div>
-        </div>
         <div class="summary-card" data-filter="usermanaged" onclick="applyFilter('usermanaged')">
             <h3>User-Managed</h3>
             <div class="summary-count" style="color: #002F5D;">{{ user_managed }}</div>
@@ -1313,6 +1309,10 @@ HTML_TEMPLATE = '''
         <div class="summary-card" data-filter="autorotated" onclick="applyFilter('autorotated')">
             <h3>Auto-Rotated</h3>
             <div class="summary-count" style="color: #1E4F18;">{{ auto_rotated }}</div>
+        </div>
+        <div class="summary-card" data-filter="tenyear" onclick="applyFilter('tenyear')">
+            <h3>Will not auto-rotate</h3>
+            <div class="summary-count" style="color: #A30000;">{{ will_not_rotate }}</div>
         </div>
     </div>
 
