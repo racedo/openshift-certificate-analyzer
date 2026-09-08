@@ -43,8 +43,8 @@ The script generates `all-cluster-certificates.csv` in the current directory wit
 - **Secret/ConfigMap**: Resource type
 - **Name**: Secret or configmap name
 - **Namespace**: Kubernetes namespace
-- **Owning component**: `openshift.io/owning-component` (Jira component). If empty: `no owner` when the OpenShift TLS collector requires it, otherwise `not required: <skip reason>` (injected CA replica, not a platform namespace, revisioned, hashed, or not InspectSecret/InspectConfigMap)
-- **Owning description**: `openshift.io/description`
+- **Owning component**: `openshift.io/owning-component` (Jira component). If empty: `no owner` when the OpenShift TLS collector requires it, or `not-required` when it does not (injected CA replica, not a platform namespace, revisioned, hashed, or not InspectSecret/InspectConfigMap)
+- **Owning description**: `openshift.io/description`, or the collector skip reason when Owning component is `not-required`
 - **Data Fields**: Keys that held certificate material (`tls.crt`, `ca.crt`, `ca-bundle.crt`, …)
 - **Validity (years)** / **Actual Expiry** / **Fingerprint**: Parsed from the first PEM
 - **Managed Status**: Platform-Managed (Auto-Rotated), Platform-Managed (10-Year, Not Auto-Rotated) for kube-apiserver / installer / HyperShift signers that never refresh, or User-Managed (Not Auto-Rotated). A 10-year lifetime alone is not enough (CNO `ovn-ca` / `signer-ca` still rotate).

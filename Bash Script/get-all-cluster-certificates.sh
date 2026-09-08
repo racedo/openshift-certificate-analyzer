@@ -765,7 +765,12 @@ process_resource() {
         if [[ "$collector_needs" == true ]]; then
             owner_col="no owner"
         else
-            owner_col="not required: $skip_reason"
+            owner_col="not-required"
+            if [[ -z "$owning_description" && -n "$skip_reason" ]]; then
+                owning_description="$skip_reason"
+            elif [[ -n "$skip_reason" && -n "$owning_description" ]]; then
+                owning_description="$owning_description; $skip_reason"
+            fi
         fi
     fi
 
@@ -982,8 +987,8 @@ echo -e "${YELLOW}📋 CSV Columns:${NC}"
 echo "   - Secret/ConfigMap: Resource type"
 echo "   - Name: Resource name"
 echo "   - Namespace: Kubernetes namespace"
-echo "   - Owning component: Jira component from openshift.io/owning-component, or 'no owner' (collector requires it), or 'not required: <skip reason>' (same labels as the discovery UI)"
-echo "   - Owning description: openshift.io/description"
+echo "   - Owning component: Jira component from openshift.io/owning-component, or 'no owner' (collector requires it), or 'not-required' (collector skip; reason is in Owning description)"
+echo "   - Owning description: openshift.io/description, or the collector skip reason when Owning component is not-required"
 echo "   - Data Fields: Available certificate data fields (tls.crt, ca.crt, ca-bundle.crt, etc.)"
 echo "   - Validity (years): Certificate validity in years"
 echo "   - Actual Expiry: Certificate expiration date"
