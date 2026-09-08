@@ -19,7 +19,9 @@ The `get-all-cluster-certificates.sh` script discovers all certificates in an Op
 - `oc` command line tool installed and configured
 - `jq` for JSON parsing
 - `openssl` for certificate parsing
+- `python3` for CSV fingerprint post-processing
 - Cluster admin or sufficient permissions to list secrets and configmaps across all namespaces
+- Linux or macOS (`date -d` on GNU, `date -j` on BSD)
 
 ## Usage
 

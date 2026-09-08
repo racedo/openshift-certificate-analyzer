@@ -49,8 +49,23 @@ This creates:
 - ClusterRole: `cert-discovery-role` (with permissions to list secrets/configmaps)
 - ClusterRoleBinding: `cert-discovery-binding`
 - Deployment: `cert-discovery-app` (Python Flask application)
+- PersistentVolumeClaim: `cert-discovery-data` (10Gi, cluster default StorageClass)
 - Service: `cert-discovery-service`
-- Route: `cert-discovery-route` (OpenShift Route for external access)
+- Route: `cert-discovery-route` (OpenShift Route for external access, **edge TLS** — see below)
+
+### HTTPS (TLS) on the Route
+
+The manifest sets `spec.tls.termination: edge` so the ingress router terminates HTTPS with the cluster default wildcard cert.
+
+On many lab clusters that cert is signed by an **internal CA**. Until you trust it, HTTPS verification fails. The Route uses `insecureEdgeTerminationPolicy: Allow` so **`http://` still works** and is not redirected to HTTPS.
+
+To trust the CA:
+
+```bash
+oc get secret -n openshift-ingress-operator router-ca -o jsonpath='{.data.tls\.crt}' | base64 -d > ingress-router-ca.pem
+```
+
+Install that PEM in your OS/browser trust store, or use `curl -k` / `curl --cacert ingress-router-ca.pem`.
 
 ### Step 3: Wait for Deployment
 
@@ -63,12 +78,16 @@ oc wait --for=condition=ready pod -l app=cert-discovery -n cert-discovery-app --
 ### Step 4: Get the Application URL
 
 ```bash
-oc get route cert-discovery-route -n cert-discovery-app -o jsonpath='https://{.spec.host}'
+HOST=$(oc get route cert-discovery-route -n cert-discovery-app -o jsonpath='{.spec.host}')
+echo "http://${HOST}/"
+echo "https://${HOST}/"
 ```
+
+Use **`http://`** first if the browser does not trust the cluster ingress certificate.
 
 ### Step 5: Access the Web Interface
 
-Open the URL from step 4 in your web browser. The page will automatically refresh every 5 minutes to show updated certificate information.
+Open the URL from step 4 in your web browser (paste the **`http://`** link if HTTPS shows a certificate warning). The page will automatically refresh every 5 minutes to show updated certificate information.
 
 ## Required Permissions
 
@@ -94,7 +113,8 @@ These permissions are bound to the `cert-discovery-sa` ServiceAccount via a Clus
 - Flask web server (port 8080)
 - Kubernetes Python client (uses in-cluster service account configuration)
 - Certificate parsing using cryptography library
-- Application code stored in ConfigMap (no persistent storage required)
+- Application code stored in ConfigMap
+- SQLite history on a 10Gi PVC (`cert-discovery-data`); uses the cluster default StorageClass unless you set `storageClassName` in `deploy.yaml`
 
 **Resource Requirements:**
 - CPU: 200m request, 1000m limit
@@ -144,6 +164,10 @@ If the web interface shows 0 certificates:
 4. Check if there are any certificate parsing errors in the logs
 
 ### Route Not Accessible
+
+**HTTPS 503:** the Route has no `spec.tls`. Re-apply `deploy.yaml` (edge TLS is included).
+
+**HTTPS certificate errors (curl exit 60):** use **`http://`**, install the ingress CA, or `curl -k`.
 
 Check route status:
 ```bash

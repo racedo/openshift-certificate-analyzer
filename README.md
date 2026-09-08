@@ -15,6 +15,8 @@ Both tools use the same logic to discover certificates from secrets and configma
 - CA categorization (Service-CA, Platform-CA, Cluster-Proxy CA, etc.)
 - Commands to reproduce certificate details
 
+This repo deploys **only** namespace `cert-discovery-app`. It is not the [missing-owners](https://github.com/racedo/openshift-missing-owners) collector check (`cert-missing-owners`) and not the [Certificate Roadmap Console](https://github.com/racedo/openshift-cert-roadmap-console) (`cert-roadmap-console`).
+
 ## Option 1: Bash Script
 
 The bash script (`Bash Script/get-all-cluster-certificates.sh`) scans your cluster and generates a CSV file with all certificate details.
@@ -24,6 +26,8 @@ The bash script (`Bash Script/get-all-cluster-certificates.sh`) scans your clust
 - `oc` command line tool installed and configured
 - `jq` for JSON parsing
 - `openssl` for certificate parsing
+- `python3` for CSV fingerprint post-processing
+- Linux or macOS (GNU `date -d` or BSD `date -j`)
 - Cluster admin or sufficient permissions to list secrets and configmaps across all namespaces
 
 ### Installation of Dependencies
@@ -130,14 +134,14 @@ oc rollout restart deployment/cert-discovery-app -n cert-discovery-app
 
 This creates:
 - Namespace: `cert-discovery-app`
-- PersistentVolumeClaim: `cert-discovery-data` (10Gi, for historical data storage)
+- PersistentVolumeClaim: `cert-discovery-data` (10Gi, cluster default StorageClass)
 - ServiceAccount: `cert-discovery-sa`
 - ClusterRole: `cert-discovery-role` (with permissions to list secrets/configmaps)
 - ClusterRoleBinding: `cert-discovery-binding`
 - Deployment: `cert-discovery-app` (Python Flask application)
 - ConfigMap: `cert-discovery-app-code` (application code)
 - Service: `cert-discovery-service`
-- Route: `cert-discovery-route` (OpenShift Route for external access)
+- Route: `cert-discovery-route` (edge TLS; HTTP still allowed)
 
 #### Step 3: Verify Deployment
 
@@ -168,12 +172,16 @@ Database initialized and available for historical tracking
 #### Step 4: Get the Application URL
 
 ```bash
-oc get route cert-discovery-route -n cert-discovery-app -o jsonpath='https://{.spec.host}'
+HOST=$(oc get route cert-discovery-route -n cert-discovery-app -o jsonpath='{.spec.host}')
+echo "http://${HOST}/"
+echo "https://${HOST}/"
 ```
+
+Use **`http://`** first if the browser does not trust the cluster ingress certificate.
 
 #### Step 5: Access the Web Interface
 
-Open the URL from step 4 in your web browser. The page will automatically refresh every 5 minutes to show updated certificate information.
+Open the URL from step 4 in your web browser (paste the **`http://`** link if HTTPS shows a certificate warning). The page will automatically refresh every 5 minutes to show updated certificate information.
 
 ### Required Permissions
 
@@ -207,7 +215,7 @@ These permissions are bound to the `cert-discovery-sa` ServiceAccount via a Clus
 **Resource Requirements:**
 - CPU: 200m request, 1000m limit
 - Memory: 512Mi request, 2Gi limit
-- Storage: 10Gi PVC (lvms-vg1 storage class)
+- Storage: 10Gi PVC (cluster default StorageClass; override `storageClassName` in `deploy.yaml` if needed)
 
 ### Features
 
@@ -360,6 +368,10 @@ If the web interface shows 0 certificates:
 4. Check if there are any certificate parsing errors in the logs
 
 #### Route Not Accessible
+
+**HTTPS 503:** the Route has no `spec.tls`. Re-apply `Container/deploy.yaml` (edge TLS is included).
+
+**HTTPS certificate errors (curl exit 60):** use **`http://`**, install the ingress CA, or `curl -k`.
 
 Check route status:
 ```bash

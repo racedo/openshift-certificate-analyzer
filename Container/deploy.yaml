@@ -17,7 +17,8 @@ spec:
   resources:
     requests:
       storage: 10Gi
-  storageClassName: lvms-vg1
+  # Omit storageClassName so the cluster default StorageClass is used.
+  # Override here if your cluster has no default class.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -921,5 +922,10 @@ spec:
     weight: 100
   port:
     targetPort: http
+  tls:
+    termination: edge
+    # Allow HTTP and HTTPS. Redirect would force HTTPS and break browsers that
+    # do not trust the lab ingress CA.
+    insecureEdgeTerminationPolicy: Allow
   wildcardPolicy: None
 
