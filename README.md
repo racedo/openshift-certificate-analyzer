@@ -67,21 +67,18 @@ open all-cluster-certificates.csv
 
 The script generates `all-cluster-certificates.csv` in the current directory with the following columns:
 
-- **Namespace**: The namespace where the certificate was found
-- **Owning component**: `openshift.io/owning-component` (Jira component)
-- **Name**: The name of the secret or configmap
-- **Type**: Resource type (Secret or ConfigMap)
-- **Key**: The key within the resource containing the certificate
-- **Issuer**: Certificate issuer information
-- **Valid From**: Certificate validity start date
-- **Valid To**: Certificate expiration date
-- **Validity Days**: Number of days until expiration
-- **SHA256 Fingerprint**: Certificate fingerprint
-- **Managed Status**: Platform-Managed or User-Managed classification
-- **Managed Details**: Additional management details (rotation policy, etc.)
-- **TLS Registry annotations**: Relevant TLS registry annotations
-- **CA Category**: CA type classification
-- **Reproduce Command**: Command to view the certificate details
+- **Secret/ConfigMap**: Resource type
+- **Name**: Secret or configmap name
+- **Namespace**: Kubernetes namespace
+- **Owning component**: `openshift.io/owning-component` (Jira component). If empty: `no owner` when the OpenShift TLS collector requires it, otherwise `not required: <skip reason>` (injected CA replica, not a platform namespace, revisioned, hashed, or not InspectSecret/InspectConfigMap)
+- **Owning description**: `openshift.io/description`
+- **Data Fields**: Keys that held certificate material (`tls.crt`, `ca.crt`, `ca-bundle.crt`, …)
+- **Validity (years)** / **Actual Expiry** / **Fingerprint**: Parsed from the first PEM
+- **Managed Status**: Platform-Managed (Auto-Rotated), Platform-Managed (10-Year, Not Auto-Rotated) for kube-apiserver / installer / HyperShift signers that never refresh, or User-Managed (Not Auto-Rotated). A 10-year lifetime alone is not enough (CNO `ovn-ca` / `signer-ca` still rotate).
+- **Managed Details**: Issuer and rotation notes
+- **CA**: CA category
+- **TLS Registry annotations**: `openshift.io/owning-component`, `openshift.io/description`, refresh annotations
+- **OC Describe Command** / **OpenSSL Command**: Commands to inspect the same object
 
 ### Required Permissions
 
