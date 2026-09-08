@@ -145,6 +145,13 @@ is_injected_ca_bundle() {
     case "$1" in kube-root-ca.crt|openshift-service-ca.crt|service-ca.crt) return 0 ;; *) return 1 ;; esac
 }
 
+is_tls_registry_ns() {
+    case "$1" in
+        openshift-*|kubernetes-*|openshift|default|kube-system|kube-public|kubernetes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 is_operator_copied_bundle() {
     case "$1" in default-ingress-cert|assisted-trusted-ca-bundle|openshift-config-managed-trusted-ca-bundle|trusted-ca-bundle) return 0 ;; *) return 1 ;; esac
 }
@@ -427,7 +434,7 @@ process_resource() {
     local name namespace secret_type tls_crt ca_crt ca_bundle cert_crt
     local has_tls_key has_cert_key has_service_ca_bundle has_platform_ca_bundle
     local cert_not_after cert_not_before owning_component managed_cert_type
-    local jira_component description hs_ref
+    local jira_component description hs_ref is_revisioned is_hashed
     eval "$(printf '%s' "$resource_json" | jq -r '
       def a($k): (.metadata.annotations // {})[$k] // "";
       def l($k): (.metadata.labels // {})[$k] // "";
@@ -449,7 +456,9 @@ process_resource() {
         "managed_cert_type=\(l("auth.openshift.io/managed-certificate-type") | @sh)",
         "jira_component=\(a("operator.openshift.io/jira-component") | @sh)",
         "description=\(a("operator.openshift.io/description") | @sh)",
-        "hs_ref=\(if any((.metadata.annotations // {}) | keys[]; startswith("referenced-resource.hypershift.openshift.io/")) then "1" else "0" end)"
+        "hs_ref=\(if any((.metadata.annotations // {}) | keys[]; startswith("referenced-resource.hypershift.openshift.io/")) then "1" else "0" end)",
+        "is_revisioned=\(if any((.metadata.ownerReferences // [])[]; ((.name // "") | startswith("revision-status-"))) then "true" else "false" end)",
+        "is_hashed=\(if ((.metadata.labels // {}) | has("monitoring.openshift.io/hash")) then "true" else "false" end)"
       ] | join("\n")
     ' 2>/dev/null)" || return 1
 
@@ -700,11 +709,40 @@ process_resource() {
         ca_category="Unknown"
     fi
     
+    local owner_col="$owning_component"
+    local collector_needs=false
+    local skip_reason=""
+    if [[ "$injected" == true ]]; then
+        skip_reason="injected CA replica ($name); collector skips kube-root-ca.crt / service-ca copies"
+    elif ! is_tls_registry_ns "$namespace"; then
+        skip_reason="$namespace is not an OpenShift platform namespace (openshift-*, kubernetes-*, kube-system, …)"
+    elif [[ "$is_revisioned" == true ]]; then
+        skip_reason="skipped: owner reference is revision-status-*"
+    elif [[ "$is_hashed" == true ]]; then
+        skip_reason="skipped: label monitoring.openshift.io/hash"
+    elif [[ "$resource_type" == "secret" && -n "$tls_crt" ]]; then
+        collector_needs=true
+    elif [[ "$resource_type" == "configmap" && -n "$ca_bundle" ]]; then
+        collector_needs=true
+    elif [[ "$resource_type" == "secret" ]]; then
+        skip_reason="not InspectSecret: no tls.crt or kubeconfig client cert"
+    else
+        skip_reason="not InspectConfigMap: no CA-bundle key or kubeconfig CA"
+    fi
+    if [[ -z "$owner_col" ]]; then
+        if [[ "$collector_needs" == true ]]; then
+            owner_col="no owner"
+        else
+            owner_col="not required: $skip_reason"
+        fi
+    fi
+
     # Build CSV line
     local csv_line=""
     csv_line+="$(escape_csv "$resource_type"),"
     csv_line+="$(escape_csv "$name"),"
     csv_line+="$(escape_csv "$namespace"),"
+    csv_line+="$(escape_csv "$owner_col"),"
     csv_line+="$(escape_csv "$data_fields"),"
     csv_line+="$(escape_csv "$validity_years"),"
     csv_line+="$(escape_csv "$actual_expiry"),"
@@ -721,7 +759,7 @@ process_resource() {
 }
 
 # Initialize CSV file with headers
-echo "Secret/ConfigMap,Name,Namespace,Data Fields,Validity (years),Actual Expiry,Fingerprint,Managed Status,Managed Details,CA,TLS Registry annotations,OC Describe Command,OpenSSL Command" > "$CSV_FILE"
+echo "Secret/ConfigMap,Name,Namespace,Owning component,Data Fields,Validity (years),Actual Expiry,Fingerprint,Managed Status,Managed Details,CA,TLS Registry annotations,OC Describe Command,OpenSSL Command" > "$CSV_FILE"
 
 # Step 1: Get all secrets with their metadata and data keys only (avoid binary data)
 echo -e "${YELLOW}📋 Fetching all secrets from cluster...${NC}"
@@ -911,6 +949,7 @@ echo -e "${YELLOW}📋 CSV Columns:${NC}"
 echo "   - Secret/ConfigMap: Resource type"
 echo "   - Name: Resource name"
 echo "   - Namespace: Kubernetes namespace"
+echo "   - Owning component: Jira component, 'no owner', or 'not required: <collector skip reason>'"
 echo "   - Data Fields: Available certificate data fields (tls.crt, ca.crt, ca-bundle.crt, etc.)"
 echo "   - Validity (years): Certificate validity in years"
 echo "   - Actual Expiry: Certificate expiration date"

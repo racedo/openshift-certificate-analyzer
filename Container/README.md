@@ -8,6 +8,7 @@ The Certificate Discovery Web App uses the same logic as the bash script in the 
 
 - All certificates from secrets and configmaps across all namespaces
 - Certificate management status (Platform-Managed vs User-Managed)
+- Owning component (`openshift.io/owning-component`)
 - CA category classification (Service-CA, Platform-CA, Cluster-Proxy CA, etc.)
 - TLS Registry annotations
 - Certificate validity periods and expiration dates

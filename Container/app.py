@@ -511,6 +511,105 @@ def is_platform_namespace(namespace):
         return True
     return False
 
+
+def is_tls_registry_namespace(namespace):
+    """OpenShift TLS-collector platform namespaces (certgraphanalysis)."""
+    if (namespace or '').startswith('openshift-') or (namespace or '').startswith('kubernetes-'):
+        return True
+    return namespace in (
+        'openshift', 'default', 'kube-system', 'kube-public', 'kubernetes',
+    )
+
+
+def is_revisioned_tls_object(obj):
+    for ref in getattr(obj.metadata, 'owner_references', None) or []:
+        if str(getattr(ref, 'name', '') or '').startswith('revision-status-'):
+            return True
+    return False
+
+
+def is_monitoring_hashed_tls_object(obj):
+    labels = obj.metadata.labels or {}
+    return 'monitoring.openshift.io/hash' in labels
+
+
+def _obj_data_text(value, b64=False):
+    if value is None:
+        return ''
+    try:
+        if isinstance(value, bytes):
+            raw = value
+        elif b64:
+            raw = base64.b64decode(value)
+        else:
+            return value if isinstance(value, str) else str(value)
+        return raw.decode('utf-8', errors='ignore')
+    except Exception:
+        if isinstance(value, bytes):
+            return value.decode('utf-8', errors='ignore')
+        return str(value)
+
+
+def origin_registry_kind(resource_type, obj):
+    """How the OpenShift TLS collector classifies this object, or '' if skipped."""
+    if is_revisioned_tls_object(obj) or is_monitoring_hashed_tls_object(obj):
+        return ''
+    data = obj.data or {}
+    keys = set(data.keys())
+    if resource_type == 'secret':
+        if 'tls.crt' in keys:
+            return 'certificate'
+        skip = {'tls.crt', 'tls.key', 'cert.key', 'ca.crt'}
+        for key, value in data.items():
+            if key in skip:
+                continue
+            text = _obj_data_text(value, b64=True)
+            if 'clusters:' in text and 'client-certificate-data' in text:
+                return 'certificate'
+        return ''
+    for _key, value in data.items():
+        text = _obj_data_text(value, b64=False)
+        if 'clusters:' in text and 'certificate-authority-data' in text:
+            return 'ca-bundle'
+    if any(k in keys for k in ORIGIN_CA_BUNDLE_KEYS):
+        return 'ca-bundle'
+    return ''
+
+
+def determine_tls_registry_status(namespace, owning_component, injected_ca_copy, origin_kind=''):
+    if injected_ca_copy:
+        return 'injected-copy'
+    if not is_tls_registry_namespace(namespace):
+        return 'out-of-registry'
+    if not origin_kind:
+        return 'not-origin-artifact'
+    if owning_component:
+        return 'registered'
+    return 'uncovered'
+
+
+def collector_owner_skip_reason(resource_type, obj, namespace, name):
+    """Why owning-component is not required, or '' if the collector requires it."""
+    ns = namespace or ''
+    if name in INJECTED_CA_BUNDLE_NAMES:
+        return (
+            f'Injected CA replica ({name}); collector skips kube-root-ca.crt / service-ca copies'
+        )
+    if not is_tls_registry_namespace(ns):
+        return (
+            f'{ns} is not an OpenShift platform namespace '
+            f'(openshift-*, kubernetes-*, kube-system, …)'
+        )
+    if is_revisioned_tls_object(obj):
+        return 'Skipped: owner reference is revision-status-*'
+    if is_monitoring_hashed_tls_object(obj):
+        return 'Skipped: label monitoring.openshift.io/hash'
+    if origin_registry_kind(resource_type, obj):
+        return ''
+    if resource_type == 'secret':
+        return 'Not InspectSecret: no tls.crt or kubeconfig client cert'
+    return 'Not InspectConfigMap: no CA-bundle key or kubeconfig CA'
+
 # kube-apiserver foreverPeriod secrets: Refresh at 80% of 10y is 8y, so they never rotate.
 KAS_NO_ROTATE = frozenset({
     'localhost-serving-signer',
@@ -552,6 +651,16 @@ KNOWN_NON_ROTATE_CN = frozenset({
 INJECTED_CA_BUNDLE_NAMES = frozenset({
     'kube-root-ca.crt', 'openshift-service-ca.crt', 'service-ca.crt',
 })
+# library-go InspectConfigMap CA bundle keys (OpenShift TLS collector).
+ORIGIN_CA_BUNDLE_KEYS = (
+    'ca-bundle.crt',
+    'client-ca-file',
+    'client-ca.crt',
+    'metrics-ca-bundle.crt',
+    'requestheader-client-ca-file',
+    'image-registry.openshift-image-registry.svc..5000',
+    'image-registry.openshift-image-registry.svc.cluster.local..5000',
+)
 OPERATOR_COPIED_BUNDLE_NAMES = frozenset({
     'default-ingress-cert',
     'assisted-trusted-ca-bundle',
@@ -812,10 +921,24 @@ def process_resource(v1, resource_type, name, namespace):
             will_not_rotate = False
             no_rotate_reason = ''
         
+        owning_component = annotations.get('openshift.io/owning-component', '')
+        owning_description = annotations.get('openshift.io/description', '')
+        origin_kind = origin_registry_kind(resource_type, obj) if is_tls_registry_namespace(namespace) else ''
+        tls_registry_status = determine_tls_registry_status(
+            namespace, owning_component, injected, origin_kind
+        )
+        needs_owning_component = tls_registry_status in ('uncovered', 'registered')
+        owner_not_required_reason = (
+            '' if needs_owning_component else
+            collector_owner_skip_reason(resource_type, obj, namespace, name)
+        )
+
         # Build relevant annotations (one per line)
         relevant_annos = []
-        if 'openshift.io/owning-component' in annotations:
-            relevant_annos.append(f"openshift.io/owning-component: {annotations['openshift.io/owning-component']}")
+        if owning_component:
+            relevant_annos.append(f"openshift.io/owning-component: {owning_component}")
+        if owning_description:
+            relevant_annos.append(f"openshift.io/description: {owning_description}")
         if 'auth.openshift.io/certificate-not-before' in annotations:
             relevant_annos.append(f"auth.openshift.io/certificate-not-before: {annotations['auth.openshift.io/certificate-not-before']}")
         if 'auth.openshift.io/certificate-not-after' in annotations:
@@ -825,6 +948,12 @@ def process_resource(v1, resource_type, name, namespace):
             'resource_type': resource_type,
             'name': name,
             'namespace': namespace,
+            'owning_component': owning_component,
+            'owning_description': owning_description,
+            'origin_kind': origin_kind,
+            'tls_registry_status': tls_registry_status,
+            'needs_owning_component': needs_owning_component,
+            'owner_not_required_reason': owner_not_required_reason,
             'data_fields': ', '.join(cert_fields),
             'validity_years': validity_years,
             'expiry': expiry,
@@ -1181,6 +1310,13 @@ HTML_TEMPLATE = '''
             text-decoration: underline dotted #8A8A8A;
         }
         .cert-table th a:hover { text-decoration: underline; }
+        th[title], .has-tip {
+            text-decoration: underline dotted #8A8A8A;
+            text-underline-offset: 3px;
+            cursor: help;
+        }
+        .muted { color: #6A6A6A; font-size: 0.8em; }
+        .owner-cell { max-width: 280px; word-wrap: break-word; }
         .cert-table th.row-num, .cert-table td.row-num {
             width: 2.4em;
             text-align: right;
@@ -1323,14 +1459,15 @@ HTML_TEMPLATE = '''
                 <th><a href="#" onclick="return sortBy(1)">Resource Type</a></th>
                 <th><a href="#" onclick="return sortBy(2)">Name</a></th>
                 <th><a href="#" onclick="return sortBy(3)">Namespace</a></th>
-                <th><a href="#" onclick="return sortBy(4)">Data Fields</a></th>
-                <th><a href="#" onclick="return sortBy(5)">Validity (Years)</a></th>
-                <th><a href="#" onclick="return sortBy(6)">Expiry</a></th>
-                <th><a href="#" onclick="return sortBy(7)">Fingerprint</a></th>
-                <th><a href="#" onclick="return sortBy(8)">Managed Status</a></th>
-                <th><a href="#" onclick="return sortBy(9)">Managed Details</a></th>
-                <th><a href="#" onclick="return sortBy(10)">CA Category</a></th>
-                <th><a href="#" onclick="return sortBy(11)">TLS Registry annotations</a></th>
+                <th class="has-tip" title="Jira component in openshift.io/owning-component. Description is openshift.io/description."><a href="#" onclick="return sortBy(4)">Owning component</a></th>
+                <th><a href="#" onclick="return sortBy(5)">Data Fields</a></th>
+                <th><a href="#" onclick="return sortBy(6)">Validity (Years)</a></th>
+                <th><a href="#" onclick="return sortBy(7)">Expiry</a></th>
+                <th><a href="#" onclick="return sortBy(8)">Fingerprint</a></th>
+                <th><a href="#" onclick="return sortBy(9)">Managed Status</a></th>
+                <th><a href="#" onclick="return sortBy(10)">Managed Details</a></th>
+                <th><a href="#" onclick="return sortBy(11)">CA Category</a></th>
+                <th><a href="#" onclick="return sortBy(12)">TLS Registry annotations</a></th>
             </tr>
         </thead>
         <tbody id="cert-body">
@@ -1345,6 +1482,20 @@ HTML_TEMPLATE = '''
                 <td>{{ cert.resource_type }}</td>
                 <td>{{ cert.name }}</td>
                 <td>{{ cert.namespace }}</td>
+                <td class="owner-cell">
+                    {% if cert.owning_component %}
+                    {{ cert.owning_component }}
+                    {% if cert.owning_description %}
+                    <div class="muted" title="{{ cert.owning_description }}">{{ cert.owning_description[:180] }}{% if cert.owning_description | length > 180 %}…{% endif %}</div>
+                    {% endif %}
+                    {% elif cert.needs_owning_component %}
+                    <span class="status-critical">no owner</span>
+                    <div class="muted">Does not comply: collector requires openshift.io/owning-component</div>
+                    {% else %}
+                    <span class="status-user">not required</span>
+                    <div class="muted">{{ cert.owner_not_required_reason }}</div>
+                    {% endif %}
+                </td>
                 <td>{{ cert.data_fields }}</td>
                 <td>{{ cert.validity_years }}</td>
                 <td>{{ cert.expiry }}</td>

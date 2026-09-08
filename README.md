@@ -68,6 +68,7 @@ open all-cluster-certificates.csv
 The script generates `all-cluster-certificates.csv` in the current directory with the following columns:
 
 - **Namespace**: The namespace where the certificate was found
+- **Owning component**: `openshift.io/owning-component` (Jira component)
 - **Name**: The name of the secret or configmap
 - **Type**: Resource type (Secret or ConfigMap)
 - **Key**: The key within the resource containing the certificate
